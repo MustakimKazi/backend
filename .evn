@@ -1,0 +1,5 @@
+PORT=4000
+MONGO_USER=mohdmustakimkazi_db_user
+MONGO_PASS=HugPu2kIqGxOdhNF
+MONGO_CLUSTER=whatsapp.dzac4go.mongodb.net
+MONGO_DB=whatsapp
