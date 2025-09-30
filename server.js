@@ -9,132 +9,131 @@ const bodyParser = require('body-parser');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { MongoClient } = require('mongodb');
 
 // ================== Environment Setup ==================
 console.log('🚀 Starting WhatsApp Server...');
 console.log('🔍 Environment Check:');
-console.log('PORT:', process.env.PORT || '5000');
+console.log('PORT:', process.env.PORT || '10000');
 console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
 
-// ================== MongoDB Configuration ==================
-// Fixed MongoDB connection - using your exact credentials from screenshot
-const MONGODB_CONFIG = {
-  user: 'mohdmustakimkazi_db_user',
-  password: 'HugPu2kIqGxOdhNF',
-  cluster: 'whatsapp.dzac4go.mongodb.net', // Fixed cluster name
-  dbName: 'whatsapp'
+// ================== Static Users Configuration ==================
+const STATIC_USERS = {
+  mustakim: {
+    id: '1',
+    username: 'mustakim',
+    email: 'mustakim@gmail.com',
+    password: '123456',
+    displayName: 'Mustakim',
+    avatar: '👨‍💻',
+    status: 'online',
+    isStatic: true
+  },
+  taniya: {
+    id: '2',
+    username: 'taniya',
+    email: 'taniya@gmail.com',
+    password: '123456',
+    displayName: 'Taniya',
+    avatar: '😎',
+    status: 'online',
+    isStatic: true
+  },
+  aliya: {
+    id: '3', 
+    username: 'aliya',
+    email: 'aliya@gmail.com',
+    password: '123456',
+    displayName: 'Aliya',
+    avatar: '👩‍💼',
+    status: 'online',
+    isStatic: true
+  },
+  saniya: {
+    id: '4',
+    username: 'saniya',
+    email: 'saniya@gmail.com',
+    password: '123456',
+    displayName: 'Saniya',
+    avatar: '👑',
+    status: 'online',
+    isStatic: true
+  }
 };
 
-// Correct connection string format
-const MONGODB_URI = `mongodb+srv://${MONGODB_CONFIG.user}:${MONGODB_CONFIG.password}@${MONGODB_CONFIG.cluster}/${MONGODB_CONFIG.dbName}?retryWrites=true&w=majority`;
-
-console.log('🔗 MongoDB URI configured');
-
-// ================== Database Service ==================
-let dbClient = null;
-let isMongoConnected = false;
-
-// Memory storage as fallback
+// ================== Memory Storage ==================
 const memoryStorage = {
-  users: [
-    {
-      _id: '1',
-      username: 'mustskim',
-      email: 'mustskim@gmail.com',
-      password_hash: '$2a$10$rQdUO9BspOYR8B6u6t1kE.Fz6BJWfE9Y9YQ9YQ9YQ9YQ9YQ9YQ9YQ', // demo123
-      token: null,
-      status: 'offline',
-      createdAt: new Date().toISOString()
-    },
-    {
-      _id: '2',
-      username: 'admin',
-      email: 'admin@example.com',
-      password_hash: '$2a$10$rQdUO9BspOYR8B6u6t1kE.Fz6BJWfE9Y9YQ9YQ9YQ9YQ9YQ9YQ9YQ', // demo123
-      token: null,
-      status: 'offline',
-      createdAt: new Date().toISOString()
-    }
-  ],
+  users: Object.values(STATIC_USERS).map(user => ({
+    _id: user.id,
+    username: user.username,
+    email: user.email,
+    password_hash: bcrypt.hashSync(user.password, 10),
+    displayName: user.displayName,
+    avatar: user.avatar,
+    token: null,
+    status: 'offline',
+    isStatic: true,
+    createdAt: new Date().toISOString()
+  })),
   messages: [
     {
       id: '1',
-      sender: 'mustskim',
-      content: 'Hello everyone! 👋',
+      sender: 'mustakim',
+      senderName: 'Mustakim',
+      content: 'Hello everyone! 👋 Welcome to our WhatsApp Clone!',
       room: 'general',
-      timestamp: new Date().toISOString(),
-      isFile: false
+      timestamp: new Date(Date.now() - 3600000).toISOString(),
+      isFile: false,
+      avatar: '👨‍💻'
     },
     {
-      id: '2',
-      sender: 'admin',
-      content: 'Welcome to WhatsApp Clone! 🚀',
+      id: '2', 
+      sender: 'taniya',
+      senderName: 'Taniya',
+      content: 'Hey Mustakim! This app looks amazing! 🚀',
       room: 'general',
+      timestamp: new Date(Date.now() - 1800000).toISOString(),
+      isFile: false,
+      avatar: '😎'
+    },
+    {
+      id: '3',
+      sender: 'aliya',
+      senderName: 'Aliya',
+      content: 'I love the design! Great work everyone! 💫',
+      room: 'general',
+      timestamp: new Date(Date.now() - 900000).toISOString(),
+      isFile: false,
+      avatar: '👩‍💼'
+    },
+    {
+      id: '4',
+      sender: 'saniya',
+      senderName: 'Saniya',
+      content: 'Ready to chat with all of you! ✅',
+      room: 'general', 
       timestamp: new Date().toISOString(),
-      isFile: false
+      isFile: false,
+      avatar: '👑'
     }
   ],
-  rooms: ['general', 'random', 'help', 'tech', 'games']
+  rooms: ['general', 'random', 'help', 'tech', 'games', 'social']
 };
 
+// Simple database service using only memory storage
 class DatabaseService {
   constructor() {
-    this.db = null;
-    this.isConnected = false;
+    this.db = this.getMemoryDB();
   }
 
   async connect() {
-    if (this.isConnected && this.db) return this.db;
-
-    try {
-      console.log('🔄 Attempting MongoDB connection...');
-      console.log('📡 Cluster:', MONGODB_CONFIG.cluster);
-      
-      const client = new MongoClient(MONGODB_URI, {
-        serverSelectionTimeoutMS: 10000,
-        connectTimeoutMS: 15000,
-        maxPoolSize: 10,
-        // Remove SSL options that cause issues
-      });
-
-      await client.connect();
-      this.db = client.db(MONGODB_CONFIG.dbName);
-      this.isConnected = true;
-      dbClient = client;
-      isMongoConnected = true;
-
-      console.log('✅ MongoDB Connected Successfully!');
-      
-      // Test the connection
-      await this.db.command({ ping: 1 });
-      console.log('🎯 MongoDB Ping Successful');
-      
-      // Initialize collections
-      await this.initializeCollections();
-      
-      return this.db;
-
-    } catch (error) {
-      console.log('⚠️  MongoDB connection failed, using memory storage');
-      console.log('💡 Connection details:', {
-        cluster: MONGODB_CONFIG.cluster,
-        database: MONGODB_CONFIG.dbName,
-        error: error.message
-      });
-      
-      // Return memory database interface
-      return this.getMemoryDB();
-    }
+    console.log('💾 Using Memory Storage Database');
+    return this.db;
   }
 
   getMemoryDB() {
     return {
       collection: (name) => this.getMemoryCollection(name),
-      command: (cmd) => Promise.resolve({ ok: 1 }), // For ping command
-      listCollections: () => ({
-        toArray: () => Promise.resolve(Object.keys(memoryStorage).map(name => ({ name })))
-      })
+      command: (cmd) => Promise.resolve({ ok: 1 })
     };
   }
 
@@ -149,7 +148,6 @@ class DatabaseService {
             results = results.filter(item => {
               for (let key in query) {
                 if (key === '$or') {
-                  // Handle $or queries
                   return query[key].some(condition => {
                     for (let orKey in condition) {
                       if (item[orKey] === condition[orKey]) return true;
@@ -291,38 +289,8 @@ class DatabaseService {
     };
   }
 
-  async initializeCollections() {
-    try {
-      const collections = await this.db.listCollections().toArray();
-      const collectionNames = collections.map(col => col.name);
-
-      if (!collectionNames.includes('users')) {
-        await this.db.createCollection('users');
-        console.log('✅ Users collection created');
-      } else {
-        const userCount = await this.db.collection('users').countDocuments();
-        console.log(`✅ Users collection exists with ${userCount} users`);
-      }
-
-      if (!collectionNames.includes('messages')) {
-        await this.db.createCollection('messages');
-        console.log('✅ Messages collection created');
-      } else {
-        const messageCount = await this.db.collection('messages').countDocuments();
-        console.log(`✅ Messages collection exists with ${messageCount} messages`);
-      }
-
-    } catch (error) {
-      console.log('ℹ️  Collections initialization note:', error.message);
-    }
-  }
-
   async close() {
-    if (dbClient) {
-      await dbClient.close();
-      this.isConnected = false;
-      console.log('🔌 MongoDB connection closed');
-    }
+    console.log('🔌 Database service closed');
   }
 }
 
@@ -340,7 +308,8 @@ app.use(cors({
     'http://localhost:5173',
     'http://localhost:3000',
     'https://whatsapp-n8xf.vercel.app',
-    'https://whatsapp-60un.onrender.com'
+    'https://whatsapp-60un.onrender.com',
+    'http://localhost:10000'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
@@ -381,7 +350,8 @@ app.get('/', (req, res) => {
     success: true,
     message: 'WhatsApp Clone API Server 🚀',
     version: '2.0.0',
-    database: isMongoConnected ? 'MongoDB' : 'Memory Storage',
+    database: 'Memory Storage',
+    staticUsers: Object.keys(STATIC_USERS),
     status: 'Running',
     timestamp: new Date().toISOString()
   });
@@ -394,10 +364,114 @@ app.get('/api/health', async (req, res) => {
   res.json({
     success: true,
     status: 'Server is healthy 🟢',
-    database: isMongoConnected ? 'MongoDB Connected 🟢' : 'Memory Storage 🟡',
+    database: 'Memory Storage 🟢',
+    staticUsers: Object.keys(STATIC_USERS).length,
+    totalMessages: memoryStorage.messages.length,
+    totalUsers: memoryStorage.users.length,
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()) + ' seconds'
   });
+});
+
+// Get Static Users Info
+app.get('/api/static-users', (req, res) => {
+  const usersInfo = Object.values(STATIC_USERS).map(user => ({
+    username: user.username,
+    displayName: user.displayName,
+    avatar: user.avatar,
+    email: user.email,
+    password: user.password
+  }));
+
+  res.json({
+    success: true,
+    users: usersInfo,
+    message: 'Use these credentials for instant login'
+  });
+});
+
+// Quick Login - Direct login without password for static users
+app.post('/api/quick-login', async (req, res) => {
+  try {
+    const { username } = req.body;
+
+    if (!username) {
+      return res.status(400).json({
+        success: false,
+        error: 'Username is required',
+        availableUsers: Object.keys(STATIC_USERS)
+      });
+    }
+
+    const staticUser = STATIC_USERS[username.toLowerCase()];
+    if (!staticUser) {
+      return res.status(400).json({
+        success: false,
+        error: `User '${username}' not found. Available users: ${Object.keys(STATIC_USERS).join(', ')}`
+      });
+    }
+
+    const db = await database.connect();
+    const users = db.collection('users');
+
+    // Find the user
+    let user = await users.findOne({ username: staticUser.username });
+
+    // If user doesn't exist, create from static data
+    if (!user) {
+      user = {
+        _id: staticUser.id,
+        username: staticUser.username,
+        email: staticUser.email,
+        password_hash: bcrypt.hashSync(staticUser.password, 10),
+        displayName: staticUser.displayName,
+        avatar: staticUser.avatar,
+        token: null,
+        status: 'offline',
+        isStatic: true,
+        createdAt: new Date().toISOString()
+      };
+      await users.insertOne(user);
+    }
+
+    // Generate token
+    const token = generateToken();
+
+    // Update user status
+    await users.updateOne(
+      { username: staticUser.username },
+      { 
+        $set: { 
+          token, 
+          status: 'online',
+          lastLogin: new Date().toISOString()
+        } 
+      }
+    );
+
+    console.log(`✅ Quick login: ${staticUser.displayName}`);
+
+    res.json({
+      success: true,
+      message: `Welcome ${staticUser.displayName}! ${staticUser.avatar}`,
+      user: {
+        id: user._id,
+        username: user.username,
+        displayName: user.displayName,
+        email: user.email,
+        avatar: user.avatar,
+        token: token,
+        isStatic: true
+      }
+    });
+
+  } catch (error) {
+    console.error('Quick login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Quick login failed'
+    });
+  }
 });
 
 // File upload
@@ -428,71 +502,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 });
 
-// Sign Up
-app.post('/api/sign_up', async (req, res) => {
-  try {
-    const { email, username, password } = req.body;
-
-    if (!email || !username || !password) {
-      return res.status(400).json({
-        success: false,
-        error: 'All fields are required'
-      });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        error: 'Password must be at least 6 characters'
-      });
-    }
-
-    const db = await database.connect();
-    const users = db.collection('users');
-
-    // Check existing user
-    const existingUser = await users.findOne({
-      $or: [{ email }, { username }]
-    });
-
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        error: 'User already exists'
-      });
-    }
-
-    // Hash password
-    const password_hash = await bcrypt.hash(password, 10);
-
-    // Create user
-    const result = await users.insertOne({
-      email,
-      username,
-      password_hash,
-      token: null,
-      status: 'offline',
-      createdAt: new Date().toISOString()
-    });
-
-    console.log('✅ New user registered:', username);
-
-    res.json({
-      success: true,
-      message: 'Account created successfully! Please login.',
-      user: { username, email }
-    });
-
-  } catch (error) {
-    console.error('Signup error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Registration failed'
-    });
-  }
-});
-
-// Login
+// Regular Login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -507,8 +517,10 @@ app.post('/api/login', async (req, res) => {
     const db = await database.connect();
     const users = db.collection('users');
 
-    // Find user
-    const user = await users.findOne({ email });
+    // Find user by email or username
+    const user = await users.findOne({ 
+      $or: [{ email }, { username: email }] 
+    });
 
     if (!user) {
       return res.status(404).json({
@@ -532,7 +544,7 @@ app.post('/api/login', async (req, res) => {
 
     // Update user
     await users.updateOne(
-      { email },
+      { _id: user._id },
       { 
         $set: { 
           token, 
@@ -542,15 +554,19 @@ app.post('/api/login', async (req, res) => {
       }
     );
 
-    console.log('✅ User logged in:', user.username);
+    console.log('✅ User logged in:', user.displayName || user.username);
 
     res.json({
       success: true,
-      message: `Welcome back, ${user.username}!`,
+      message: `Welcome back, ${user.displayName || user.username}! ${user.avatar || '👋'}`,
       user: {
+        id: user._id,
         username: user.username,
+        displayName: user.displayName,
         email: user.email,
-        token: token
+        avatar: user.avatar,
+        token: token,
+        isStatic: user.isStatic || false
       }
     });
 
@@ -563,96 +579,20 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Demo Login
-app.post('/api/demo-login', async (req, res) => {
-  try {
-    const { account } = req.body;
-
-    const demoAccounts = {
-      mustskim: {
-        email: 'mustskim@gmail.com',
-        username: 'mustskim',
-        password: 'demo123'
-      },
-      admin: {
-        email: 'admin@example.com', 
-        username: 'admin',
-        password: 'demo123'
-      }
-    };
-
-    const demo = demoAccounts[account];
-    if (!demo) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid demo account'
-      });
-    }
-
-    const db = await database.connect();
-    const users = db.collection('users');
-
-    // Find or create user
-    let user = await users.findOne({ email: demo.email });
-    
-    if (!user) {
-      const password_hash = await bcrypt.hash(demo.password, 10);
-      await users.insertOne({
-        email: demo.email,
-        username: demo.username,
-        password_hash,
-        token: null,
-        status: 'offline',
-        createdAt: new Date().toISOString()
-      });
-      user = await users.findOne({ email: demo.email });
-    }
-
-    // Generate token
-    const token = generateToken();
-
-    await users.updateOne(
-      { email: demo.email },
-      { 
-        $set: { 
-          token, 
-          status: 'online',
-          lastLogin: new Date().toISOString()
-        } 
-      }
-    );
-
-    res.json({
-      success: true,
-      message: `Demo login successful! Welcome ${demo.username}`,
-      user: {
-        username: user.username,
-        email: user.email,
-        token: token
-      }
-    });
-
-  } catch (error) {
-    console.error('Demo login error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Demo login failed'
-    });
-  }
-});
-
-// Get Users
+// Get All Users
 app.get('/api/users', async (req, res) => {
   try {
     const db = await database.connect();
     const users = await db.collection('users')
       .find({})
       .project({ password_hash: 0, token: 0 })
+      .sort({ username: 1 })
       .toArray();
 
     res.json({
       success: true,
-      users: users
+      users: users,
+      count: users.length
     });
 
   } catch (error) {
@@ -664,7 +604,7 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Get Messages
+// Get Messages for Room
 app.get('/api/messages/:room', async (req, res) => {
   try {
     const { room } = req.params;
@@ -676,7 +616,9 @@ app.get('/api/messages/:room', async (req, res) => {
 
     res.json({
       success: true,
-      messages: messages
+      room: room,
+      messages: messages,
+      count: messages.length
     });
 
   } catch (error) {
@@ -701,10 +643,10 @@ app.post('/api/messages', async (req, res) => {
       });
     }
 
-    if (!content) {
+    if (!content || content.trim().length === 0) {
       return res.status(400).json({
         success: false,
-        error: 'Message content required'
+        error: 'Message content cannot be empty'
       });
     }
 
@@ -724,9 +666,12 @@ app.post('/api/messages', async (req, res) => {
     const messageData = {
       id: uuid.v4(),
       sender: user.username,
-      content: content,
+      senderName: user.displayName || user.username,
+      content: content.trim(),
       room: room,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      avatar: user.avatar,
+      isFile: false
     };
 
     await messages.insertOne(messageData);
@@ -749,7 +694,7 @@ app.post('/api/messages', async (req, res) => {
 // Get Rooms
 app.get('/api/rooms', async (req, res) => {
   try {
-    const rooms = ['general', 'random', 'help', 'tech', 'games'];
+    const rooms = ['general', 'random', 'help', 'tech', 'games', 'social'];
     res.json({
       success: true,
       rooms: rooms
@@ -782,10 +727,12 @@ wss.on('connection', (ws) => {
             type: 'auth_success',
             user: {
               username: user.username,
-              email: user.email
+              displayName: user.displayName,
+              email: user.email,
+              avatar: user.avatar
             }
           }));
-          console.log('✅ WebSocket authenticated:', user.username);
+          console.log('✅ WebSocket authenticated:', user.displayName || user.username);
         }
       }
 
@@ -796,9 +743,11 @@ wss.on('connection', (ws) => {
         const messageData = {
           id: uuid.v4(),
           sender: ws.user.username,
+          senderName: ws.user.displayName || ws.user.username,
           content: message.content,
           room: message.room || 'general',
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          avatar: ws.user.avatar
         };
 
         await messages.insertOne(messageData);
@@ -813,7 +762,7 @@ wss.on('connection', (ws) => {
           }
         });
 
-        console.log(`💬 Message from ${ws.user.username} in ${messageData.room}`);
+        console.log(`💬 Message from ${ws.user.displayName} in ${messageData.room}`);
       }
 
     } catch (error) {
@@ -823,37 +772,56 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (ws.user) {
-      console.log('🔌 User disconnected:', ws.user.username);
+      console.log('🔌 User disconnected:', ws.user.displayName || ws.user.username);
     }
+  });
+});
+
+// ================== Error Handling ==================
+// Fixed 404 handler - removed problematic path pattern
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found: ' + req.originalUrl
+  });
+});
+
+// Error handler
+app.use((error, req, res, next) => {
+  console.error('🚨 Server error:', error);
+  res.status(500).json({
+    success: false,
+    error: 'Internal server error'
   });
 });
 
 // ================== Start Server ==================
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000;
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log('='.repeat(60));
+  console.log('='.repeat(70));
   console.log(`🚀 WhatsApp Server Running on Port ${PORT}`);
   console.log(`🌐 URL: http://localhost:${PORT}`);
-  console.log(`💾 Database: ${isMongoConnected ? 'MongoDB 🟢' : 'Memory Storage 🟡'}`);
-  console.log(`📡 WebSocket: Ready`);
+  console.log(`💾 Database: Memory Storage 🟢`);
+  console.log(`👥 Static Users: ${Object.keys(STATIC_USERS).join(', ')}`);
+  console.log(`🎯 Quick Login: POST /api/quick-login`);
   console.log(`✅ Health: http://localhost:${PORT}/api/health`);
-  console.log('='.repeat(60));
+  console.log('='.repeat(70));
   
-  // Test database connection
-  database.connect().then(db => {
-    if (isMongoConnected) {
-      console.log('🎉 MongoDB: Connected and Ready');
-    } else {
-      console.log('🔄 Using Memory Storage - All features available');
-      console.log('👤 Demo accounts: mustskim / admin (password: demo123)');
-    }
+  // Display static users info
+  console.log('\n📋 Available Static Users (Password: 123456):');
+  Object.values(STATIC_USERS).forEach(user => {
+    console.log(`   ${user.avatar} ${user.displayName} (${user.username}) - ${user.email}`);
   });
+  console.log('\n💡 Usage:');
+  console.log('   Quick Login: POST /api/quick-login with {"username": "mustakim"}');
+  console.log('   Regular Login: POST /api/login with {"email": "mustakim@gmail.com", "password": "123456"}');
+  console.log('='.repeat(70));
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
-  console.log('\n🔄 Shutting down server...');
+  console.log('\n🔄 Shutting down server gracefully...');
   await database.close();
   process.exit(0);
 });
