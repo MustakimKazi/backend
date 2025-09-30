@@ -116,7 +116,9 @@ const memoryStorage = {
       avatar: '👑'
     }
   ],
-  rooms: ['general', 'random', 'help', 'tech', 'games', 'social']
+  rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
+  // Track active WebSocket connections
+  activeConnections: new Map()
 };
 
 // Enhanced Database service with delete functionality
@@ -297,7 +299,12 @@ const database = new DatabaseService();
 // ================== Express App Setup ==================
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ 
+  server,
+  // Add WebSocket server configuration
+  perMessageDeflate: false,
+  clientTracking: true
+});
 
 // ================== Middleware ==================
 app.use(cors({
@@ -339,6 +346,32 @@ function generateToken() {
   return uuid.v4();
 }
 
+function broadcastToAllClients(wss, data) {
+  const message = JSON.stringify(data);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting to client:', error);
+      }
+    }
+  });
+}
+
+function broadcastToRoom(wss, room, data) {
+  const message = JSON.stringify(data);
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+      try {
+        client.send(message);
+      } catch (error) {
+        console.error('Error broadcasting to client in room:', error);
+      }
+    }
+  });
+}
+
 // ================== API Routes ==================
 
 // Root endpoint
@@ -350,11 +383,12 @@ app.get('/', (req, res) => {
     database: 'Memory Storage',
     staticUsers: Object.keys(STATIC_USERS),
     status: 'Running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    activeConnections: wss.clients.size
   });
 });
 
-// Health check
+// Health check with WebSocket status
 app.get('/api/health', async (req, res) => {
   const db = await database.connect();
   
@@ -365,6 +399,7 @@ app.get('/api/health', async (req, res) => {
     staticUsers: Object.keys(STATIC_USERS).length,
     totalMessages: memoryStorage.messages.length,
     totalUsers: memoryStorage.users.length,
+    activeConnections: wss.clients.size,
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()) + ' seconds'
   });
@@ -719,6 +754,16 @@ app.delete('/api/messages/:room', async (req, res) => {
 
     console.log(`🗑️ API: Cleared ${result.deletedCount} messages from room: ${room} by user: ${user.username}`);
 
+    // Broadcast clear event to all clients
+    broadcastToAllClients(wss, {
+      type: 'clear',
+      room: room,
+      clearedBy: user.username,
+      clearedByName: user.displayName || user.username,
+      timestamp: new Date().toISOString(),
+      message: `Chat cleared by ${user.displayName || user.username}`
+    });
+
     res.json({
       success: true,
       message: `Chat cleared successfully in room ${room}`,
@@ -802,14 +847,37 @@ app.get('/api/rooms', async (req, res) => {
 });
 
 // ================== WebSocket Handling ==================
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   console.log('🔌 New WebSocket connection');
+  console.log(`📊 Total connections: ${wss.clients.size}`);
+  
   ws.user = null;
   ws.isAuthenticated = false;
+  ws.connectionId = uuid.v4();
+  ws.lastPing = Date.now();
+
+  // Set up ping-pong to keep connection alive
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.ping();
+        ws.lastPing = Date.now();
+      } catch (error) {
+        console.error('Error sending ping:', error);
+        clearInterval(pingInterval);
+      }
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 30000); // Ping every 30 seconds
+
+  ws.on('pong', () => {
+    ws.lastPing = Date.now();
+  });
 
   ws.on('message', async (data) => {
     try {
-      const message = JSON.parse(data);
+      const message = JSON.parse(data.toString());
 
       // Authentication
       if (message.type === 'auth') {
@@ -820,6 +888,18 @@ wss.on('connection', (ws) => {
         if (user) {
           ws.user = user;
           ws.isAuthenticated = true;
+          
+          // Update user status to online
+          await users.updateOne(
+            { _id: user._id },
+            { $set: { status: 'online' } }
+          );
+
+          // Get online users
+          const onlineUsers = await users.find({ status: 'online' })
+            .project({ username: 1, displayName: 1, avatar: 1 })
+            .toArray();
+
           ws.send(JSON.stringify({
             type: 'authSuccess',
             user: {
@@ -829,9 +909,21 @@ wss.on('connection', (ws) => {
               avatar: user.avatar
             },
             rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-            users: await users.find({ status: 'online' }).project({ username: 1 }).toArray()
+            users: onlineUsers
           }));
+
           console.log('✅ WebSocket authenticated:', user.displayName || user.username);
+
+          // Notify other users about new user online
+          broadcastToAllClients(wss, {
+            type: 'users',
+            data: onlineUsers
+          });
+        } else {
+          ws.send(JSON.stringify({
+            type: 'authError',
+            error: 'Authentication failed'
+          }));
         }
       }
 
@@ -854,16 +946,10 @@ wss.on('connection', (ws) => {
 
         await messages.insertOne(messageData);
 
-        // Broadcast to all connected clients in the same room
-        const broadcastData = JSON.stringify({
+        // Broadcast to all connected clients
+        broadcastToAllClients(wss, {
           type: 'message',
           data: messageData
-        });
-
-        wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
-            client.send(broadcastData);
-          }
         });
 
         console.log(`💬 Message from ${ws.user.displayName} in ${messageData.room}`);
@@ -880,20 +966,15 @@ wss.on('connection', (ws) => {
         // Delete all messages from the specified room
         const result = await messages.deleteMany({ room: room });
 
-        // Broadcast clear event to all connected clients in the same room
-        const broadcastData = JSON.stringify({
+        // Broadcast clear event to all connected clients
+        broadcastToAllClients(wss, {
           type: 'clear',
           room: room,
           clearedBy: ws.user.username,
           clearedByName: ws.user.displayName || ws.user.username,
           timestamp: new Date().toISOString(),
-          message: `Chat cleared by ${ws.user.displayName || ws.user.username}`
-        });
-
-        wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
-            client.send(broadcastData);
-          }
+          message: `Chat cleared by ${ws.user.displayName || ws.user.username}`,
+          deletedCount: result.deletedCount
         });
 
         console.log(`✅ Chat cleared for room ${room}. Removed ${result.deletedCount} messages`);
@@ -901,30 +982,86 @@ wss.on('connection', (ws) => {
 
       // Typing indicator
       if (message.type === 'typing' && ws.isAuthenticated) {
-        const broadcastData = JSON.stringify({
+        const broadcastData = {
           type: 'typing',
           username: ws.user.username,
+          displayName: ws.user.displayName || ws.user.username,
           typing: message.typing,
           room: message.room
-        });
+        };
 
-        wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN && client.isAuthenticated && client !== ws) {
-            client.send(broadcastData);
-          }
-        });
+        broadcastToRoom(wss, message.room, broadcastData);
+      }
+
+      // Connection check
+      if (message.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
       }
 
     } catch (error) {
-      console.error('WebSocket error:', error);
+      console.error('WebSocket message error:', error);
+      try {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: 'Invalid message format'
+        }));
+      } catch (sendError) {
+        console.error('Error sending error message:', sendError);
+      }
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', async (code, reason) => {
+    console.log(`🔌 WebSocket disconnected: ${code} - ${reason}`);
+    console.log(`📊 Remaining connections: ${wss.clients.size}`);
+    
+    clearInterval(pingInterval);
+
     if (ws.user) {
-      console.log('🔌 User disconnected:', ws.user.displayName || ws.user.username);
+      console.log('👤 User disconnected:', ws.user.displayName || ws.user.username);
+      
+      // Update user status to offline after a delay
+      setTimeout(async () => {
+        const db = await database.connect();
+        const users = db.collection('users');
+        
+        // Check if user has reconnected
+        const currentUser = await users.findOne({ _id: ws.user._id });
+        if (currentUser && currentUser.status === 'online') {
+          // User might have reconnected, don't set to offline
+          return;
+        }
+        
+        await users.updateOne(
+          { _id: ws.user._id },
+          { $set: { status: 'offline' } }
+        );
+
+        // Get updated online users list
+        const onlineUsers = await users.find({ status: 'online' })
+          .project({ username: 1, displayName: 1, avatar: 1 })
+          .toArray();
+
+        // Broadcast updated users list
+        broadcastToAllClients(wss, {
+          type: 'users',
+          data: onlineUsers
+        });
+      }, 5000); // 5 second delay
     }
   });
+
+  ws.on('error', (error) => {
+    console.error('❌ WebSocket error:', error);
+  });
+
+  // Send welcome message
+  ws.send(JSON.stringify({
+    type: 'connection',
+    status: 'connected',
+    message: 'WebSocket connected successfully',
+    connectionId: ws.connectionId
+  }));
 });
 
 // ================== Error Handling ==================
@@ -973,6 +1110,12 @@ server.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🔄 Shutting down server gracefully...');
+  
+  // Close all WebSocket connections
+  wss.clients.forEach(client => {
+    client.close(1001, 'Server shutting down');
+  });
+  
   await database.close();
   process.exit(0);
 });
