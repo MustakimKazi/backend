@@ -176,40 +176,6 @@ class DatabaseService {
               });
             }
             return Promise.resolve(results);
-          },
-          project: (projection) => ({
-            toArray: () => {
-              let results = [...collection];
-              if (projection) {
-                results = results.map(item => {
-                  const newItem = {};
-                  for (let key in item) {
-                    if (projection[key] !== 0) {
-                      newItem[key] = item[key];
-                    }
-                  }
-                  return newItem;
-                });
-              }
-              return Promise.resolve(results);
-            }
-          })
-        }),
-        project: (projection) => ({
-          toArray: () => {
-            let results = [...collection];
-            if (projection) {
-              results = results.map(item => {
-                const newItem = {};
-                for (let key in item) {
-                  if (projection[key] !== 0) {
-                    newItem[key] = item[key];
-                  }
-                }
-                return newItem;
-              });
-            }
-            return Promise.resolve(results);
           }
         })
       }),
@@ -707,15 +673,17 @@ app.get('/api/rooms', async (req, res) => {
   }
 });
 
-// ================== WebSocket ==================
+// ================== WebSocket Handling ==================
 wss.on('connection', (ws) => {
   console.log('🔌 New WebSocket connection');
   ws.user = null;
+  ws.isAuthenticated = false;
 
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data);
 
+      // Authentication
       if (message.type === 'auth') {
         const db = await database.connect();
         const users = db.collection('users');
@@ -723,20 +691,24 @@ wss.on('connection', (ws) => {
         
         if (user) {
           ws.user = user;
+          ws.isAuthenticated = true;
           ws.send(JSON.stringify({
-            type: 'auth_success',
+            type: 'authSuccess',
             user: {
               username: user.username,
               displayName: user.displayName,
               email: user.email,
               avatar: user.avatar
-            }
+            },
+            rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
+            users: await users.find({ status: 'online' }).project({ username: 1 }).toArray()
           }));
           console.log('✅ WebSocket authenticated:', user.displayName || user.username);
         }
       }
 
-      if (message.type === 'message' && ws.user) {
+      // Send message
+      if (message.type === 'message' && ws.isAuthenticated && ws.user) {
         const db = await database.connect();
         const messages = db.collection('messages');
 
@@ -747,22 +719,42 @@ wss.on('connection', (ws) => {
           content: message.content,
           room: message.room || 'general',
           timestamp: new Date().toISOString(),
-          avatar: ws.user.avatar
+          avatar: ws.user.avatar,
+          isFile: message.isFile || false,
+          fileType: message.fileType || ''
         };
 
         await messages.insertOne(messageData);
 
-        // Broadcast to all clients
+        // Broadcast to all connected clients in the same room
+        const broadcastData = JSON.stringify({
+          type: 'message',
+          data: messageData
+        });
+
         wss.clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-              type: 'new_message',
-              data: messageData
-            }));
+          if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+            client.send(broadcastData);
           }
         });
 
         console.log(`💬 Message from ${ws.user.displayName} in ${messageData.room}`);
+      }
+
+      // Typing indicator
+      if (message.type === 'typing' && ws.isAuthenticated) {
+        const broadcastData = JSON.stringify({
+          type: 'typing',
+          username: ws.user.username,
+          typing: message.typing,
+          room: message.room
+        });
+
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && client.isAuthenticated && client !== ws) {
+            client.send(broadcastData);
+          }
+        });
       }
 
     } catch (error) {
@@ -778,20 +770,19 @@ wss.on('connection', (ws) => {
 });
 
 // ================== Error Handling ==================
-// Fixed 404 handler - removed problematic path pattern
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found: ' + req.originalUrl
-  });
-});
-
-// Error handler
 app.use((error, req, res, next) => {
   console.error('🚨 Server error:', error);
   res.status(500).json({
     success: false,
     error: 'Internal server error'
+  });
+});
+
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found: ' + req.originalUrl
   });
 });
 
