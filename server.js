@@ -119,7 +119,7 @@ const memoryStorage = {
   rooms: ['general', 'random', 'help', 'tech', 'games', 'social']
 };
 
-// Simple database service using only memory storage
+// Enhanced Database service with delete functionality
 class DatabaseService {
   constructor() {
     this.db = this.getMemoryDB();
@@ -233,6 +233,37 @@ class DatabaseService {
           modifiedCount: 0, 
           acknowledged: true 
         });
+      },
+
+      deleteMany: (query = {}) => {
+        const initialLength = collection.length;
+        
+        if (Object.keys(query).length === 0) {
+          // Delete all documents
+          memoryStorage[name] = [];
+          return Promise.resolve({ 
+            deletedCount: initialLength,
+            acknowledged: true 
+          });
+        } else {
+          // Delete documents matching query
+          const remaining = collection.filter(item => {
+            for (let key in query) {
+              if (item[key] !== query[key]) {
+                return true; // Keep this item
+              }
+            }
+            return false; // Remove this item
+          });
+          
+          const deletedCount = collection.length - remaining.length;
+          memoryStorage[name] = remaining;
+          
+          return Promise.resolve({ 
+            deletedCount: deletedCount,
+            acknowledged: true 
+          });
+        }
       },
 
       countDocuments: (query = {}) => {
@@ -657,6 +688,103 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
+// Clear all messages in a room
+app.delete('/api/messages/:room', async (req, res) => {
+  try {
+    const { room } = req.params;
+    const token = req.headers.authorization;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
+
+    const db = await database.connect();
+    const users = db.collection('users');
+    const messages = db.collection('messages');
+
+    // Verify user
+    const user = await users.findOne({ token });
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    // Delete all messages from the room
+    const result = await messages.deleteMany({ room });
+
+    console.log(`🗑️ API: Cleared ${result.deletedCount} messages from room: ${room} by user: ${user.username}`);
+
+    res.json({
+      success: true,
+      message: `Chat cleared successfully in room ${room}`,
+      room: room,
+      deletedCount: result.deletedCount,
+      clearedBy: user.username,
+      clearedByName: user.displayName || user.username,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Clear messages error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to clear messages'
+    });
+  }
+});
+
+// Clear all messages (admin only - optional)
+app.delete('/api/messages', async (req, res) => {
+  try {
+    const token = req.headers.authorization;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
+
+    const db = await database.connect();
+    const users = db.collection('users');
+    const messages = db.collection('messages');
+
+    // Verify user
+    const user = await users.findOne({ token });
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    // Delete all messages
+    const result = await messages.deleteMany({});
+
+    console.log(`🗑️ API: Cleared ALL messages (${result.deletedCount}) by user: ${user.username}`);
+
+    res.json({
+      success: true,
+      message: 'All messages cleared successfully',
+      deletedCount: result.deletedCount,
+      clearedBy: user.username,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    console.error('Clear all messages error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to clear all messages'
+    });
+  }
+});
+
 // Get Rooms
 app.get('/api/rooms', async (req, res) => {
   try {
@@ -741,6 +869,36 @@ wss.on('connection', (ws) => {
         console.log(`💬 Message from ${ws.user.displayName} in ${messageData.room}`);
       }
 
+      // Clear chat messages for a room
+      if (message.type === 'clear' && ws.isAuthenticated && ws.user) {
+        const db = await database.connect();
+        const messages = db.collection('messages');
+        const room = message.room || 'general';
+
+        console.log(`🗑️ Clearing chat for room: ${room} by user: ${ws.user.username}`);
+
+        // Delete all messages from the specified room
+        const result = await messages.deleteMany({ room: room });
+
+        // Broadcast clear event to all connected clients in the same room
+        const broadcastData = JSON.stringify({
+          type: 'clear',
+          room: room,
+          clearedBy: ws.user.username,
+          clearedByName: ws.user.displayName || ws.user.username,
+          timestamp: new Date().toISOString(),
+          message: `Chat cleared by ${ws.user.displayName || ws.user.username}`
+        });
+
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+            client.send(broadcastData);
+          }
+        });
+
+        console.log(`✅ Chat cleared for room ${room}. Removed ${result.deletedCount} messages`);
+      }
+
       // Typing indicator
       if (message.type === 'typing' && ws.isAuthenticated) {
         const broadcastData = JSON.stringify({
@@ -796,6 +954,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`💾 Database: Memory Storage 🟢`);
   console.log(`👥 Static Users: ${Object.keys(STATIC_USERS).join(', ')}`);
   console.log(`🎯 Quick Login: POST /api/quick-login`);
+  console.log(`🗑️ Clear Chat: DELETE /api/messages/:room`);
   console.log(`✅ Health: http://localhost:${PORT}/api/health`);
   console.log('='.repeat(70));
   
@@ -807,6 +966,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('\n💡 Usage:');
   console.log('   Quick Login: POST /api/quick-login with {"username": "mustakim"}');
   console.log('   Regular Login: POST /api/login with {"email": "mustakim@gmail.com", "password": "123456"}');
+  console.log('   Clear Chat: DELETE /api/messages/general or WebSocket "clear" message');
   console.log('='.repeat(70));
 });
 
