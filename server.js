@@ -25,7 +25,8 @@ const STATIC_USERS = {
     password: '123456',
     displayName: 'Mustakim',
     avatar: '👨‍💻',
-    status: 'online',
+    status: 'offline',
+    lastSeen: new Date().toISOString(),
     isStatic: true
   },
   taniya: {
@@ -35,7 +36,8 @@ const STATIC_USERS = {
     password: '123456',
     displayName: 'Taniya',
     avatar: '😎',
-    status: 'online',
+    status: 'offline',
+    lastSeen: new Date().toISOString(),
     isStatic: true
   },
   aliya: {
@@ -45,7 +47,8 @@ const STATIC_USERS = {
     password: '123456',
     displayName: 'Aliya',
     avatar: '👩‍💼',
-    status: 'online',
+    status: 'offline',
+    lastSeen: new Date().toISOString(),
     isStatic: true
   },
   saniya: {
@@ -55,7 +58,8 @@ const STATIC_USERS = {
     password: '123456',
     displayName: 'Saniya',
     avatar: '👑',
-    status: 'online',
+    status: 'offline',
+    lastSeen: new Date().toISOString(),
     isStatic: true
   }
 };
@@ -71,6 +75,7 @@ const memoryStorage = {
     avatar: user.avatar,
     token: null,
     status: 'offline',
+    lastSeen: new Date().toISOString(),
     isStatic: true,
     createdAt: new Date().toISOString()
   })),
@@ -237,6 +242,34 @@ class DatabaseService {
         });
       },
 
+      updateMany: (query, update) => {
+        let modifiedCount = 0;
+        
+        collection.forEach((item, index) => {
+          let shouldUpdate = true;
+          for (let key in query) {
+            if (item[key] !== query[key]) {
+              shouldUpdate = false;
+              break;
+            }
+          }
+          
+          if (shouldUpdate && update.$set) {
+            memoryStorage[name][index] = {
+              ...memoryStorage[name][index],
+              ...update.$set,
+              updatedAt: new Date().toISOString()
+            };
+            modifiedCount++;
+          }
+        });
+        
+        return Promise.resolve({ 
+          modifiedCount: modifiedCount, 
+          acknowledged: true 
+        });
+      },
+
       deleteMany: (query = {}) => {
         const initialLength = collection.length;
         
@@ -372,6 +405,47 @@ function broadcastToRoom(wss, room, data) {
   });
 }
 
+// Enhanced user status management
+async function updateUserStatus(username, status, db) {
+  try {
+    const users = db.collection('users');
+    const updateData = { 
+      status: status,
+      ...(status === 'offline' && { lastSeen: new Date().toISOString() })
+    };
+    
+    await users.updateOne(
+      { username: username },
+      { $set: updateData }
+    );
+    
+    console.log(`👤 ${username} is now ${status}`);
+    
+    // Broadcast user status update
+    const onlineUsers = await users.find({ status: 'online' })
+      .project({ username: 1, displayName: 1, avatar: 1, lastSeen: 1 })
+      .toArray();
+      
+    broadcastToAllClients(wss, {
+      type: 'userStatusUpdate',
+      users: onlineUsers,
+      timestamp: new Date().toISOString()
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error updating user status:', error);
+    return false;
+  }
+}
+
+// Get online users count
+async function getOnlineUsersCount(db) {
+  const users = db.collection('users');
+  const onlineUsers = await users.find({ status: 'online' }).toArray();
+  return onlineUsers.length;
+}
+
 // ================== API Routes ==================
 
 // Root endpoint
@@ -391,6 +465,7 @@ app.get('/', (req, res) => {
 // Health check with WebSocket status
 app.get('/api/health', async (req, res) => {
   const db = await database.connect();
+  const onlineCount = await getOnlineUsersCount(db);
   
   res.json({
     success: true,
@@ -399,10 +474,43 @@ app.get('/api/health', async (req, res) => {
     staticUsers: Object.keys(STATIC_USERS).length,
     totalMessages: memoryStorage.messages.length,
     totalUsers: memoryStorage.users.length,
+    onlineUsers: onlineCount,
     activeConnections: wss.clients.size,
     timestamp: new Date().toISOString(),
     uptime: Math.floor(process.uptime()) + ' seconds'
   });
+});
+
+// Get online users
+app.get('/api/online-users', async (req, res) => {
+  try {
+    const db = await database.connect();
+    const users = db.collection('users');
+    
+    const onlineUsers = await users.find({ status: 'online' })
+      .project({ password_hash: 0, token: 0 })
+      .toArray();
+      
+    const offlineUsers = await users.find({ status: 'offline' })
+      .project({ username: 1, displayName: 1, avatar: 1, lastSeen: 1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      onlineCount: onlineUsers.length,
+      totalCount: memoryStorage.users.length,
+      onlineUsers: onlineUsers,
+      offlineUsers: offlineUsers,
+      activeConnections: wss.clients.size
+    });
+
+  } catch (error) {
+    console.error('Get online users error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch online users'
+    });
+  }
 });
 
 // Get Static Users Info
@@ -460,6 +568,7 @@ app.post('/api/quick-login', async (req, res) => {
         avatar: staticUser.avatar,
         token: null,
         status: 'offline',
+        lastSeen: new Date().toISOString(),
         isStatic: true,
         createdAt: new Date().toISOString()
       };
@@ -469,13 +578,15 @@ app.post('/api/quick-login', async (req, res) => {
     // Generate token
     const token = generateToken();
 
-    // Update user status
+    // Update user status to online
+    await updateUserStatus(staticUser.username, 'online', db);
+    
+    // Update token
     await users.updateOne(
       { username: staticUser.username },
       { 
         $set: { 
-          token, 
-          status: 'online',
+          token,
           lastLogin: new Date().toISOString()
         } 
       }
@@ -483,16 +594,21 @@ app.post('/api/quick-login', async (req, res) => {
 
     console.log(`✅ Quick login: ${staticUser.displayName}`);
 
+    // Get updated user data
+    const updatedUser = await users.findOne({ username: staticUser.username });
+
     res.json({
       success: true,
       message: `Welcome ${staticUser.displayName}! ${staticUser.avatar}`,
       user: {
-        id: user._id,
-        username: user.username,
-        displayName: user.displayName,
-        email: user.email,
-        avatar: user.avatar,
-        token: token,
+        id: updatedUser._id,
+        username: updatedUser.username,
+        displayName: updatedUser.displayName,
+        email: updatedUser.email,
+        avatar: updatedUser.avatar,
+        token: updatedUser.token,
+        status: updatedUser.status,
+        lastSeen: updatedUser.lastSeen,
         isStatic: true
       }
     });
@@ -574,13 +690,15 @@ app.post('/api/login', async (req, res) => {
     // Generate token
     const token = generateToken();
 
-    // Update user
+    // Update user status to online
+    await updateUserStatus(user.username, 'online', db);
+    
+    // Update token
     await users.updateOne(
       { _id: user._id },
       { 
         $set: { 
-          token, 
-          status: 'online',
+          token,
           lastLogin: new Date().toISOString()
         } 
       }
@@ -588,17 +706,22 @@ app.post('/api/login', async (req, res) => {
 
     console.log('✅ User logged in:', user.displayName || user.username);
 
+    // Get updated user data
+    const updatedUser = await users.findOne({ _id: user._id });
+
     res.json({
       success: true,
       message: `Welcome back, ${user.displayName || user.username}! ${user.avatar || '👋'}`,
       user: {
-        id: user._id,
-        username: user.username,
-        displayName: user.displayName,
-        email: user.email,
-        avatar: user.avatar,
-        token: token,
-        isStatic: user.isStatic || false
+        id: updatedUser._id,
+        username: updatedUser.username,
+        displayName: updatedUser.displayName,
+        email: updatedUser.email,
+        avatar: updatedUser.avatar,
+        token: updatedUser.token,
+        status: updatedUser.status,
+        lastSeen: updatedUser.lastSeen,
+        isStatic: updatedUser.isStatic || false
       }
     });
 
@@ -611,7 +734,62 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Get All Users
+// Logout endpoint
+app.post('/api/logout', async (req, res) => {
+  try {
+    const token = req.headers.authorization;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
+
+    const db = await database.connect();
+    const users = db.collection('users');
+
+    // Find user by token
+    const user = await users.findOne({ token });
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid token'
+      });
+    }
+
+    // Update user status to offline
+    await updateUserStatus(user.username, 'offline', db);
+    
+    // Clear token
+    await users.updateOne(
+      { _id: user._id },
+      { 
+        $set: { 
+          token: null,
+          lastLogout: new Date().toISOString()
+        } 
+      }
+    );
+
+    console.log('✅ User logged out:', user.displayName || user.username);
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully'
+    });
+
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Logout failed'
+    });
+  }
+});
+
+// Get All Users with enhanced status information
 app.get('/api/users', async (req, res) => {
   try {
     const db = await database.connect();
@@ -621,10 +799,19 @@ app.get('/api/users', async (req, res) => {
       .sort({ username: 1 })
       .toArray();
 
+    // Add connection status based on active WebSocket connections
+    const usersWithConnectionStatus = users.map(user => ({
+      ...user,
+      isConnected: Array.from(wss.clients).some(client => 
+        client.isAuthenticated && client.user && client.user.username === user.username
+      )
+    }));
+
     res.json({
       success: true,
-      users: users,
-      count: users.length
+      users: usersWithConnectionStatus,
+      count: users.length,
+      onlineCount: users.filter(u => u.status === 'online').length
     });
 
   } catch (error) {
@@ -890,15 +1077,22 @@ wss.on('connection', (ws, req) => {
           ws.isAuthenticated = true;
           
           // Update user status to online
-          await users.updateOne(
-            { _id: user._id },
-            { $set: { status: 'online' } }
-          );
+          await updateUserStatus(user.username, 'online', db);
 
-          // Get online users
-          const onlineUsers = await users.find({ status: 'online' })
-            .project({ username: 1, displayName: 1, avatar: 1 })
+          // Get all users for online status
+          const allUsers = await users.find({})
+            .project({ username: 1, displayName: 1, avatar: 1, status: 1, lastSeen: 1 })
             .toArray();
+
+          // Get online users count
+          const onlineUsers = allUsers.filter(u => u.status === 'online');
+          
+          // Store connection in active connections
+          memoryStorage.activeConnections.set(user.username, {
+            ws: ws,
+            user: user,
+            connectedAt: new Date().toISOString()
+          });
 
           ws.send(JSON.stringify({
             type: 'authSuccess',
@@ -906,18 +1100,26 @@ wss.on('connection', (ws, req) => {
               username: user.username,
               displayName: user.displayName,
               email: user.email,
-              avatar: user.avatar
+              avatar: user.avatar,
+              status: user.status,
+              lastSeen: user.lastSeen
             },
             rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-            users: onlineUsers
+            users: allUsers,
+            onlineCount: onlineUsers.length
           }));
 
           console.log('✅ WebSocket authenticated:', user.displayName || user.username);
 
-          // Notify other users about new user online
+          // Broadcast user online status to all clients
           broadcastToAllClients(wss, {
-            type: 'users',
-            data: onlineUsers
+            type: 'userOnline',
+            username: user.username,
+            displayName: user.displayName,
+            avatar: user.avatar,
+            timestamp: new Date().toISOString(),
+            onlineCount: onlineUsers.length,
+            users: allUsers
           });
         } else {
           ws.send(JSON.stringify({
@@ -1020,33 +1222,25 @@ wss.on('connection', (ws, req) => {
     if (ws.user) {
       console.log('👤 User disconnected:', ws.user.displayName || ws.user.username);
       
-      // Update user status to offline after a delay
+      // Remove from active connections
+      memoryStorage.activeConnections.delete(ws.user.username);
+      
+      // Update user status to offline after a short delay
       setTimeout(async () => {
         const db = await database.connect();
-        const users = db.collection('users');
         
         // Check if user has reconnected
-        const currentUser = await users.findOne({ _id: ws.user._id });
-        if (currentUser && currentUser.status === 'online') {
-          // User might have reconnected, don't set to offline
-          return;
-        }
+        const currentConnections = Array.from(memoryStorage.activeConnections.entries())
+          .filter(([username, conn]) => username === ws.user.username);
         
-        await users.updateOne(
-          { _id: ws.user._id },
-          { $set: { status: 'offline' } }
-        );
-
-        // Get updated online users list
-        const onlineUsers = await users.find({ status: 'online' })
-          .project({ username: 1, displayName: 1, avatar: 1 })
-          .toArray();
-
-        // Broadcast updated users list
-        broadcastToAllClients(wss, {
-          type: 'users',
-          data: onlineUsers
-        });
+        if (currentConnections.length === 0) {
+          // User hasn't reconnected, set to offline
+          await updateUserStatus(ws.user.username, 'offline', db);
+          
+          console.log(`👤 ${ws.user.username} set to offline`);
+        } else {
+          console.log(`👤 ${ws.user.username} reconnected, keeping online status`);
+        }
       }, 5000); // 5 second delay
     }
   });
@@ -1091,6 +1285,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`💾 Database: Memory Storage 🟢`);
   console.log(`👥 Static Users: ${Object.keys(STATIC_USERS).join(', ')}`);
   console.log(`🎯 Quick Login: POST /api/quick-login`);
+  console.log(`👤 Online Users: GET /api/online-users`);
   console.log(`🗑️ Clear Chat: DELETE /api/messages/:room`);
   console.log(`✅ Health: http://localhost:${PORT}/api/health`);
   console.log('='.repeat(70));
@@ -1103,6 +1298,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('\n💡 Usage:');
   console.log('   Quick Login: POST /api/quick-login with {"username": "mustakim"}');
   console.log('   Regular Login: POST /api/login with {"email": "mustakim@gmail.com", "password": "123456"}');
+  console.log('   Online Users: GET /api/online-users');
   console.log('   Clear Chat: DELETE /api/messages/general or WebSocket "clear" message');
   console.log('='.repeat(70));
 });
@@ -1110,6 +1306,26 @@ server.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🔄 Shutting down server gracefully...');
+  
+  // Set all online users to offline
+  try {
+    const db = await database.connect();
+    const users = db.collection('users');
+    
+    await users.updateMany(
+      { status: 'online' },
+      { 
+        $set: { 
+          status: 'offline',
+          lastSeen: new Date().toISOString()
+        } 
+      }
+    );
+    
+    console.log('✅ All users set to offline');
+  } catch (error) {
+    console.error('Error setting users offline:', error);
+  }
   
   // Close all WebSocket connections
   wss.clients.forEach(client => {
