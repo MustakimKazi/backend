@@ -12,9 +12,6 @@ const fs = require('fs');
 
 // ================== Environment Setup ==================
 console.log('🚀 Starting WhatsApp Server...');
-console.log('🔍 Environment Check:');
-console.log('PORT:', process.env.PORT || '10000');
-console.log('NODE_ENV:', process.env.NODE_ENV || 'development');
 
 // ================== Static Users Configuration ==================
 const STATIC_USERS = {
@@ -77,7 +74,9 @@ const memoryStorage = {
     status: 'offline',
     lastSeen: new Date().toISOString(),
     isStatic: true,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    lastLogin: null,
+    lastLogout: null
   })),
   messages: [
     {
@@ -122,11 +121,11 @@ const memoryStorage = {
     }
   ],
   rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-  // Track active WebSocket connections
-  activeConnections: new Map()
+  activeConnections: new Map(),
+  typingUsers: new Map() // Track typing users per room
 };
 
-// Enhanced Database service with delete functionality
+// Enhanced Database service
 class DatabaseService {
   constructor() {
     this.db = this.getMemoryDB();
@@ -134,6 +133,7 @@ class DatabaseService {
 
   async connect() {
     console.log('💾 Using Memory Storage Database');
+    console.log(`📊 Total users in memory: ${memoryStorage.users.length}`);
     return this.db;
   }
 
@@ -244,7 +244,6 @@ class DatabaseService {
 
       updateMany: (query, update) => {
         let modifiedCount = 0;
-        
         collection.forEach((item, index) => {
           let shouldUpdate = true;
           for (let key in query) {
@@ -253,7 +252,6 @@ class DatabaseService {
               break;
             }
           }
-          
           if (shouldUpdate && update.$set) {
             memoryStorage[name][index] = {
               ...memoryStorage[name][index],
@@ -263,7 +261,6 @@ class DatabaseService {
             modifiedCount++;
           }
         });
-        
         return Promise.resolve({ 
           modifiedCount: modifiedCount, 
           acknowledged: true 
@@ -272,28 +269,23 @@ class DatabaseService {
 
       deleteMany: (query = {}) => {
         const initialLength = collection.length;
-        
         if (Object.keys(query).length === 0) {
-          // Delete all documents
           memoryStorage[name] = [];
           return Promise.resolve({ 
             deletedCount: initialLength,
             acknowledged: true 
           });
         } else {
-          // Delete documents matching query
           const remaining = collection.filter(item => {
             for (let key in query) {
               if (item[key] !== query[key]) {
-                return true; // Keep this item
+                return true;
               }
             }
-            return false; // Remove this item
+            return false;
           });
-          
           const deletedCount = collection.length - remaining.length;
           memoryStorage[name] = remaining;
-          
           return Promise.resolve({ 
             deletedCount: deletedCount,
             acknowledged: true 
@@ -334,7 +326,6 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ 
   server,
-  // Add WebSocket server configuration
   perMessageDeflate: false,
   clientTracking: true
 });
@@ -392,10 +383,12 @@ function broadcastToAllClients(wss, data) {
   });
 }
 
-function broadcastToRoom(wss, room, data) {
+function broadcastToRoom(wss, room, data, excludeUser = null) {
   const message = JSON.stringify(data);
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN && client.isAuthenticated) {
+    if (client.readyState === WebSocket.OPEN && 
+        client.isAuthenticated && 
+        (!excludeUser || client.user.username !== excludeUser)) {
       try {
         client.send(message);
       } catch (error) {
@@ -411,7 +404,12 @@ async function updateUserStatus(username, status, db) {
     const users = db.collection('users');
     const updateData = { 
       status: status,
-      ...(status === 'offline' && { lastSeen: new Date().toISOString() })
+      ...(status === 'offline' ? { 
+        lastSeen: new Date().toISOString(),
+        lastLogout: new Date().toISOString()
+      } : {
+        lastLogin: new Date().toISOString()
+      })
     };
     
     await users.updateOne(
@@ -421,14 +419,16 @@ async function updateUserStatus(username, status, db) {
     
     console.log(`👤 ${username} is now ${status}`);
     
-    // Broadcast user status update
-    const onlineUsers = await users.find({ status: 'online' })
-      .project({ username: 1, displayName: 1, avatar: 1, lastSeen: 1 })
+    // Get all users for broadcasting
+    const allUsers = await users.find({})
+      .project({ password_hash: 0, token: 0 })
       .toArray();
-      
+    
+    // Broadcast user status update to all clients
     broadcastToAllClients(wss, {
       type: 'userStatusUpdate',
-      users: onlineUsers,
+      users: allUsers,
+      onlineCount: allUsers.filter(u => u.status === 'online').length,
       timestamp: new Date().toISOString()
     });
     
@@ -446,6 +446,39 @@ async function getOnlineUsersCount(db) {
   return onlineUsers.length;
 }
 
+// Handle typing indicators
+function handleTypingUpdate(username, room, isTyping) {
+  if (isTyping) {
+    // Add user to typing list for this room
+    if (!memoryStorage.typingUsers.has(room)) {
+      memoryStorage.typingUsers.set(room, new Set());
+    }
+    memoryStorage.typingUsers.get(room).add(username);
+  } else {
+    // Remove user from typing list for this room
+    if (memoryStorage.typingUsers.has(room)) {
+      memoryStorage.typingUsers.get(room).delete(username);
+    }
+  }
+  
+  // Get current typing users for this room
+  const typingUsers = memoryStorage.typingUsers.has(room) 
+    ? Array.from(memoryStorage.typingUsers.get(room)) 
+    : [];
+  
+  // Broadcast typing update to all clients in the room (except the typing user)
+  broadcastToRoom(wss, room, {
+    type: 'typingUpdate',
+    room: room,
+    typingUsers: typingUsers,
+    isTyping: isTyping,
+    username: username,
+    timestamp: new Date().toISOString()
+  }, username);
+  
+  console.log(`⌨️ ${username} ${isTyping ? 'started' : 'stopped'} typing in ${room}. Currently typing: ${typingUsers.join(', ')}`);
+}
+
 // ================== API Routes ==================
 
 // Root endpoint
@@ -456,6 +489,7 @@ app.get('/', (req, res) => {
     version: '2.0.0',
     database: 'Memory Storage',
     staticUsers: Object.keys(STATIC_USERS),
+    totalUsers: memoryStorage.users.length,
     status: 'Running',
     timestamp: new Date().toISOString(),
     activeConnections: wss.clients.size
@@ -481,7 +515,47 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
-// Get online users
+// Get ALL users with enhanced information
+app.get('/api/users', async (req, res) => {
+  try {
+    const db = await database.connect();
+    const users = await db.collection('users')
+      .find({})
+      .project({ password_hash: 0, token: 0 })
+      .sort({ username: 1 })
+      .toArray();
+
+    console.log(`📊 Sending ${users.length} users to client`);
+
+    // Add real-time connection status
+    const usersWithConnectionStatus = users.map(user => ({
+      ...user,
+      isConnected: Array.from(wss.clients).some(client => 
+        client.isAuthenticated && client.user && client.user.username === user.username
+      )
+    }));
+
+    const onlineCount = users.filter(u => u.status === 'online').length;
+
+    res.json({
+      success: true,
+      users: usersWithConnectionStatus,
+      count: users.length,
+      onlineCount: onlineCount,
+      offlineCount: users.length - onlineCount,
+      message: `Found ${users.length} users (${onlineCount} online)`
+    });
+
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch users'
+    });
+  }
+});
+
+// Get online users specifically
 app.get('/api/online-users', async (req, res) => {
   try {
     const db = await database.connect();
@@ -492,16 +566,20 @@ app.get('/api/online-users', async (req, res) => {
       .toArray();
       
     const offlineUsers = await users.find({ status: 'offline' })
-      .project({ username: 1, displayName: 1, avatar: 1, lastSeen: 1 })
+      .project({ password_hash: 0, token: 0 })
       .toArray();
+
+    console.log(`📊 Online users: ${onlineUsers.length}, Offline users: ${offlineUsers.length}`);
 
     res.json({
       success: true,
       onlineCount: onlineUsers.length,
+      offlineCount: offlineUsers.length,
       totalCount: memoryStorage.users.length,
       onlineUsers: onlineUsers,
       offlineUsers: offlineUsers,
-      activeConnections: wss.clients.size
+      activeConnections: wss.clients.size,
+      message: `${onlineUsers.length} users online, ${offlineUsers.length} offline`
     });
 
   } catch (error) {
@@ -520,12 +598,15 @@ app.get('/api/static-users', (req, res) => {
     displayName: user.displayName,
     avatar: user.avatar,
     email: user.email,
-    password: user.password
+    password: user.password,
+    status: user.status,
+    lastSeen: user.lastSeen
   }));
 
   res.json({
     success: true,
     users: usersInfo,
+    count: usersInfo.length,
     message: 'Use these credentials for instant login'
   });
 });
@@ -557,7 +638,7 @@ app.post('/api/quick-login', async (req, res) => {
     // Find the user
     let user = await users.findOne({ username: staticUser.username });
 
-    // If user doesn't exist, create from static data
+    // If user doesn't exist, create from static data (should always exist)
     if (!user) {
       user = {
         _id: staticUser.id,
@@ -573,6 +654,7 @@ app.post('/api/quick-login', async (req, res) => {
         createdAt: new Date().toISOString()
       };
       await users.insertOne(user);
+      console.log(`✅ Created static user: ${staticUser.username}`);
     }
 
     // Generate token
@@ -622,35 +704,7 @@ app.post('/api/quick-login', async (req, res) => {
   }
 });
 
-// File upload
-app.post('/api/upload', upload.single('file'), (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({
-        success: false,
-        error: 'No file uploaded'
-      });
-    }
-
-    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
-
-    res.json({
-      success: true,
-      message: 'File uploaded successfully',
-      url: fileUrl,
-      filename: req.file.filename
-    });
-
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'File upload failed'
-    });
-  }
-});
-
-// Regular Login
+// Regular login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -658,44 +712,36 @@ app.post('/api/login', async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({
         success: false,
-        error: 'Email and password required'
+        error: 'Email and password are required'
       });
     }
 
     const db = await database.connect();
     const users = db.collection('users');
 
-    // Find user by email or username
-    const user = await users.findOne({ 
-      $or: [{ email }, { username: email }] 
-    });
+    const user = await users.findOne({ email: email.toLowerCase() });
 
     if (!user) {
-      return res.status(404).json({
+      return res.status(400).json({
         success: false,
-        error: 'User not found'
+        error: 'Invalid email or password'
       });
     }
 
-    // Check password
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-
-    if (!validPassword) {
-      return res.status(401).json({
+    const isValidPassword = bcrypt.compareSync(password, user.password_hash);
+    if (!isValidPassword) {
+      return res.status(400).json({
         success: false,
-        error: 'Invalid password'
+        error: 'Invalid email or password'
       });
     }
 
-    // Generate token
     const token = generateToken();
 
-    // Update user status to online
     await updateUserStatus(user.username, 'online', db);
-    
-    // Update token
+
     await users.updateOne(
-      { _id: user._id },
+      { email: email.toLowerCase() },
       { 
         $set: { 
           token,
@@ -704,24 +750,21 @@ app.post('/api/login', async (req, res) => {
       }
     );
 
-    console.log('✅ User logged in:', user.displayName || user.username);
-
-    // Get updated user data
-    const updatedUser = await users.findOne({ _id: user._id });
+    console.log(`✅ Login: ${user.displayName || user.username}`);
 
     res.json({
       success: true,
-      message: `Welcome back, ${user.displayName || user.username}! ${user.avatar || '👋'}`,
+      message: `Welcome back ${user.displayName || user.username}!`,
       user: {
-        id: updatedUser._id,
-        username: updatedUser.username,
-        displayName: updatedUser.displayName,
-        email: updatedUser.email,
-        avatar: updatedUser.avatar,
-        token: updatedUser.token,
-        status: updatedUser.status,
-        lastSeen: updatedUser.lastSeen,
-        isStatic: updatedUser.isStatic || false
+        id: user._id,
+        username: user.username,
+        displayName: user.displayName,
+        email: user.email,
+        avatar: user.avatar,
+        token: token,
+        status: 'online',
+        lastSeen: user.lastSeen,
+        isStatic: user.isStatic
       }
     });
 
@@ -734,46 +777,38 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Logout endpoint
+// Logout
 app.post('/api/logout', async (req, res) => {
   try {
     const token = req.headers.authorization;
-
+    
     if (!token) {
-      return res.status(401).json({
+      return res.status(400).json({
         success: false,
-        error: 'Authentication required'
+        error: 'Token is required'
       });
     }
 
     const db = await database.connect();
     const users = db.collection('users');
 
-    // Find user by token
-    const user = await users.findOne({ token });
+    const user = await users.findOne({ token: token });
 
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid token'
-      });
+    if (user) {
+      await updateUserStatus(user.username, 'offline', db);
+      
+      await users.updateOne(
+        { token: token },
+        { 
+          $set: { 
+            token: null,
+            lastLogout: new Date().toISOString()
+          } 
+        }
+      );
+
+      console.log(`✅ Logout: ${user.displayName || user.username}`);
     }
-
-    // Update user status to offline
-    await updateUserStatus(user.username, 'offline', db);
-    
-    // Clear token
-    await users.updateOne(
-      { _id: user._id },
-      { 
-        $set: { 
-          token: null,
-          lastLogout: new Date().toISOString()
-        } 
-      }
-    );
-
-    console.log('✅ User logged out:', user.displayName || user.username);
 
     res.json({
       success: true,
@@ -789,55 +824,53 @@ app.post('/api/logout', async (req, res) => {
   }
 });
 
-// Get All Users with enhanced status information
-app.get('/api/users', async (req, res) => {
+// File upload
+app.post('/api/upload', upload.single('file'), (req, res) => {
   try {
-    const db = await database.connect();
-    const users = await db.collection('users')
-      .find({})
-      .project({ password_hash: 0, token: 0 })
-      .sort({ username: 1 })
-      .toArray();
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded'
+      });
+    }
 
-    // Add connection status based on active WebSocket connections
-    const usersWithConnectionStatus = users.map(user => ({
-      ...user,
-      isConnected: Array.from(wss.clients).some(client => 
-        client.isAuthenticated && client.user && client.user.username === user.username
-      )
-    }));
+    const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
 
     res.json({
       success: true,
-      users: usersWithConnectionStatus,
-      count: users.length,
-      onlineCount: users.filter(u => u.status === 'online').length
+      url: fileUrl,
+      filename: req.file.filename,
+      originalname: req.file.originalname,
+      size: req.file.size
     });
 
   } catch (error) {
-    console.error('Get users error:', error);
+    console.error('Upload error:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to fetch users'
+      error: 'File upload failed'
     });
   }
 });
 
-// Get Messages for Room
+// Get messages for a room
 app.get('/api/messages/:room', async (req, res) => {
   try {
     const { room } = req.params;
     const db = await database.connect();
-    const messages = await db.collection('messages')
-      .find({ room })
+    const messages = db.collection('messages');
+
+    const roomMessages = await messages.find({ room: room })
       .sort({ timestamp: 1 })
       .toArray();
 
+    console.log(`📨 Loaded ${roomMessages.length} messages for room: ${room}`);
+
     res.json({
       success: true,
-      room: room,
-      messages: messages,
-      count: messages.length
+      messages: roomMessages,
+      count: roomMessages.length,
+      room: room
     });
 
   } catch (error) {
@@ -849,116 +882,53 @@ app.get('/api/messages/:room', async (req, res) => {
   }
 });
 
-// Send Message
-app.post('/api/messages', async (req, res) => {
+// Get all rooms
+app.get('/api/rooms', async (req, res) => {
   try {
-    const { content, room = 'general' } = req.body;
-    const token = req.headers.authorization;
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required'
-      });
-    }
-
-    if (!content || content.trim().length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Message content cannot be empty'
-      });
-    }
-
     const db = await database.connect();
-    const users = db.collection('users');
-    const messages = db.collection('messages');
+    const rooms = db.collection('rooms');
 
-    // Verify user
-    const user = await users.findOne({ token });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid token'
-      });
-    }
-
-    const messageData = {
-      id: uuid.v4(),
-      sender: user.username,
-      senderName: user.displayName || user.username,
-      content: content.trim(),
-      room: room,
-      timestamp: new Date().toISOString(),
-      avatar: user.avatar,
-      isFile: false
-    };
-
-    await messages.insertOne(messageData);
+    const allRooms = await rooms.find({}).toArray();
+    const roomNames = allRooms.length > 0 ? allRooms.map(r => r.name) : ['general'];
 
     res.json({
       success: true,
-      message: 'Message sent successfully',
-      data: messageData
+      rooms: roomNames,
+      count: roomNames.length
     });
 
   } catch (error) {
-    console.error('Send message error:', error);
+    console.error('Get rooms error:', error);
     res.status(500).json({
       success: false,
-      error: 'Failed to send message'
+      error: 'Failed to fetch rooms'
     });
   }
 });
 
-// Clear all messages in a room
+// Clear messages in a room
 app.delete('/api/messages/:room', async (req, res) => {
   try {
     const { room } = req.params;
-    const token = req.headers.authorization;
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required'
-      });
-    }
-
     const db = await database.connect();
-    const users = db.collection('users');
     const messages = db.collection('messages');
 
-    // Verify user
-    const user = await users.findOne({ token });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid token'
-      });
-    }
+    const result = await messages.deleteMany({ room: room });
 
-    // Delete all messages from the room
-    const result = await messages.deleteMany({ room });
-
-    console.log(`🗑️ API: Cleared ${result.deletedCount} messages from room: ${room} by user: ${user.username}`);
+    console.log(`🗑️ Cleared ${result.deletedCount} messages from room: ${room}`);
 
     // Broadcast clear event to all clients
     broadcastToAllClients(wss, {
       type: 'clear',
       room: room,
-      clearedBy: user.username,
-      clearedByName: user.displayName || user.username,
-      timestamp: new Date().toISOString(),
-      message: `Chat cleared by ${user.displayName || user.username}`
+      clearedBy: 'system',
+      timestamp: new Date().toISOString()
     });
 
     res.json({
       success: true,
-      message: `Chat cleared successfully in room ${room}`,
-      room: room,
-      deletedCount: result.deletedCount,
-      clearedBy: user.username,
-      clearedByName: user.displayName || user.username,
-      timestamp: new Date().toISOString()
+      message: `Cleared ${result.deletedCount} messages from ${room}`,
+      clearedCount: result.deletedCount
     });
 
   } catch (error) {
@@ -966,69 +936,6 @@ app.delete('/api/messages/:room', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Failed to clear messages'
-    });
-  }
-});
-
-// Clear all messages (admin only - optional)
-app.delete('/api/messages', async (req, res) => {
-  try {
-    const token = req.headers.authorization;
-
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required'
-      });
-    }
-
-    const db = await database.connect();
-    const users = db.collection('users');
-    const messages = db.collection('messages');
-
-    // Verify user
-    const user = await users.findOne({ token });
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid token'
-      });
-    }
-
-    // Delete all messages
-    const result = await messages.deleteMany({});
-
-    console.log(`🗑️ API: Cleared ALL messages (${result.deletedCount}) by user: ${user.username}`);
-
-    res.json({
-      success: true,
-      message: 'All messages cleared successfully',
-      deletedCount: result.deletedCount,
-      clearedBy: user.username,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    console.error('Clear all messages error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to clear all messages'
-    });
-  }
-});
-
-// Get Rooms
-app.get('/api/rooms', async (req, res) => {
-  try {
-    const rooms = ['general', 'random', 'help', 'tech', 'games', 'social'];
-    res.json({
-      success: true,
-      rooms: rooms
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch rooms'
     });
   }
 });
@@ -1056,7 +963,7 @@ wss.on('connection', (ws, req) => {
     } else {
       clearInterval(pingInterval);
     }
-  }, 30000); // Ping every 30 seconds
+  }, 30000);
 
   ws.on('pong', () => {
     ws.lastPing = Date.now();
@@ -1079,9 +986,9 @@ wss.on('connection', (ws, req) => {
           // Update user status to online
           await updateUserStatus(user.username, 'online', db);
 
-          // Get all users for online status
+          // Get ALL users for the client
           const allUsers = await users.find({})
-            .project({ username: 1, displayName: 1, avatar: 1, status: 1, lastSeen: 1 })
+            .project({ password_hash: 0, token: 0 })
             .toArray();
 
           // Get online users count
@@ -1102,102 +1009,116 @@ wss.on('connection', (ws, req) => {
               email: user.email,
               avatar: user.avatar,
               status: user.status,
-              lastSeen: user.lastSeen
+              lastSeen: user.lastSeen,
+              isStatic: user.isStatic
             },
             rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-            users: allUsers,
-            onlineCount: onlineUsers.length
+            users: allUsers,  // Send ALL users
+            onlineCount: onlineUsers.length,
+            totalUsers: allUsers.length,
+            message: `Connected successfully. ${onlineUsers.length} users online.`
           }));
 
-          console.log('✅ WebSocket authenticated:', user.displayName || user.username);
+          console.log(`✅ WebSocket authenticated: ${user.displayName || user.username}`);
+          console.log(`📊 Sent ${allUsers.length} users to client`);
 
-          // Broadcast user online status to all clients
-          broadcastToAllClients(wss, {
-            type: 'userOnline',
-            username: user.username,
-            displayName: user.displayName,
-            avatar: user.avatar,
-            timestamp: new Date().toISOString(),
-            onlineCount: onlineUsers.length,
-            users: allUsers
-          });
         } else {
           ws.send(JSON.stringify({
             type: 'authError',
             error: 'Authentication failed'
           }));
         }
+        return;
       }
 
-      // Send message
-      if (message.type === 'message' && ws.isAuthenticated && ws.user) {
+      // Enhanced typing indicator
+      if (message.type === 'typing') {
+        if (ws.isAuthenticated && ws.user) {
+          handleTypingUpdate(ws.user.username, message.room, message.typing);
+        }
+        return;
+      }
+
+      // User status update
+      if (message.type === 'statusUpdate') {
+        if (ws.isAuthenticated && ws.user) {
+          await updateUserStatus(ws.user.username, message.status, db);
+        }
+        return;
+      }
+
+      // Handle new message
+      if (message.type === 'message') {
+        if (!ws.isAuthenticated || !ws.user) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            error: 'Not authenticated'
+          }));
+          return;
+        }
+
         const db = await database.connect();
         const messages = db.collection('messages');
 
-        const messageData = {
+        const newMessage = {
           id: uuid.v4(),
           sender: ws.user.username,
           senderName: ws.user.displayName || ws.user.username,
           content: message.content,
           room: message.room || 'general',
           timestamp: new Date().toISOString(),
-          avatar: ws.user.avatar,
           isFile: message.isFile || false,
-          fileType: message.fileType || ''
+          fileType: message.fileType || null,
+          avatar: ws.user.avatar
         };
 
-        await messages.insertOne(messageData);
+        // Save to database
+        await messages.insertOne(newMessage);
 
-        // Broadcast to all connected clients
-        broadcastToAllClients(wss, {
+        // Broadcast to all clients in the room
+        broadcastToRoom(wss, message.room || 'general', {
           type: 'message',
-          data: messageData
+          data: newMessage
         });
 
-        console.log(`💬 Message from ${ws.user.displayName} in ${messageData.room}`);
+        console.log(`📨 ${ws.user.username} sent message to ${message.room || 'general'}: ${message.content.substring(0, 50)}${message.content.length > 50 ? '...' : ''}`);
+
+        // Stop typing indicator when message is sent
+        handleTypingUpdate(ws.user.username, message.room || 'general', false);
+        return;
       }
 
-      // Clear chat messages for a room
-      if (message.type === 'clear' && ws.isAuthenticated && ws.user) {
+      // Handle clear chat
+      if (message.type === 'clear') {
+        if (!ws.isAuthenticated || !ws.user) {
+          ws.send(JSON.stringify({
+            type: 'error', 
+            error: 'Not authenticated'
+          }));
+          return;
+        }
+
         const db = await database.connect();
         const messages = db.collection('messages');
-        const room = message.room || 'general';
 
-        console.log(`🗑️ Clearing chat for room: ${room} by user: ${ws.user.username}`);
+        const result = await messages.deleteMany({ room: message.room });
 
-        // Delete all messages from the specified room
-        const result = await messages.deleteMany({ room: room });
-
-        // Broadcast clear event to all connected clients
+        // Broadcast clear event to all clients
         broadcastToAllClients(wss, {
           type: 'clear',
-          room: room,
+          room: message.room,
           clearedBy: ws.user.username,
-          clearedByName: ws.user.displayName || ws.user.username,
-          timestamp: new Date().toISOString(),
-          message: `Chat cleared by ${ws.user.displayName || ws.user.username}`,
-          deletedCount: result.deletedCount
+          timestamp: new Date().toISOString()
         });
 
-        console.log(`✅ Chat cleared for room ${room}. Removed ${result.deletedCount} messages`);
+        console.log(`🗑️ ${ws.user.username} cleared ${result.deletedCount} messages from ${message.room}`);
+        return;
       }
 
-      // Typing indicator
-      if (message.type === 'typing' && ws.isAuthenticated) {
-        const broadcastData = {
-          type: 'typing',
-          username: ws.user.username,
-          displayName: ws.user.displayName || ws.user.username,
-          typing: message.typing,
-          room: message.room
-        };
-
-        broadcastToRoom(wss, message.room, broadcastData);
-      }
-
-      // Connection check
+      // Handle ping
       if (message.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        ws.send(JSON.stringify({ type: 'pong' }));
+        return;
       }
 
     } catch (error) {
@@ -1225,6 +1146,22 @@ wss.on('connection', (ws, req) => {
       // Remove from active connections
       memoryStorage.activeConnections.delete(ws.user.username);
       
+      // Remove from all typing lists
+      memoryStorage.typingUsers.forEach((typingSet, room) => {
+        if (typingSet.has(ws.user.username)) {
+          typingSet.delete(ws.user.username);
+          // Broadcast typing stop
+          broadcastToRoom(wss, room, {
+            type: 'typingUpdate',
+            room: room,
+            typingUsers: Array.from(typingSet),
+            isTyping: false,
+            username: ws.user.username,
+            timestamp: new Date().toISOString()
+          });
+        }
+      });
+      
       // Update user status to offline after a short delay
       setTimeout(async () => {
         const db = await database.connect();
@@ -1236,12 +1173,11 @@ wss.on('connection', (ws, req) => {
         if (currentConnections.length === 0) {
           // User hasn't reconnected, set to offline
           await updateUserStatus(ws.user.username, 'offline', db);
-          
           console.log(`👤 ${ws.user.username} set to offline`);
         } else {
           console.log(`👤 ${ws.user.username} reconnected, keeping online status`);
         }
-      }, 5000); // 5 second delay
+      }, 5000);
     }
   });
 
@@ -1254,7 +1190,8 @@ wss.on('connection', (ws, req) => {
     type: 'connection',
     status: 'connected',
     message: 'WebSocket connected successfully',
-    connectionId: ws.connectionId
+    connectionId: ws.connectionId,
+    totalUsers: memoryStorage.users.length
   }));
 });
 
@@ -1284,8 +1221,10 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 URL: http://localhost:${PORT}`);
   console.log(`💾 Database: Memory Storage 🟢`);
   console.log(`👥 Static Users: ${Object.keys(STATIC_USERS).join(', ')}`);
+  console.log(`📊 Total Users in System: ${memoryStorage.users.length}`);
   console.log(`🎯 Quick Login: POST /api/quick-login`);
-  console.log(`👤 Online Users: GET /api/online-users`);
+  console.log(`👤 All Users: GET /api/users`);
+  console.log(`📈 Online Users: GET /api/online-users`);
   console.log(`🗑️ Clear Chat: DELETE /api/messages/:room`);
   console.log(`✅ Health: http://localhost:${PORT}/api/health`);
   console.log('='.repeat(70));
@@ -1298,8 +1237,8 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('\n💡 Usage:');
   console.log('   Quick Login: POST /api/quick-login with {"username": "mustakim"}');
   console.log('   Regular Login: POST /api/login with {"email": "mustakim@gmail.com", "password": "123456"}');
+  console.log('   All Users: GET /api/users');
   console.log('   Online Users: GET /api/online-users');
-  console.log('   Clear Chat: DELETE /api/messages/general or WebSocket "clear" message');
   console.log('='.repeat(70));
 });
 
