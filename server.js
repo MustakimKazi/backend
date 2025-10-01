@@ -113,10 +113,7 @@ const memoryStorage = {
   rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
   activeConnections: new Map(),
   typingUsers: new Map(),
-  messageSeenStatus: new Map(),
-  // New: Store user notification preferences and typing mentions
-  userNotifications: new Map(),
-  typingMentions: new Map()
+  messageSeenStatus: new Map() // Track seen status for messages
 };
 
 // Initialize static users
@@ -135,10 +132,7 @@ function initializeStaticUsers() {
     isStatic: true,
     createdAt: new Date().toISOString(),
     lastLogin: null,
-    lastLogout: null,
-    // New: Notification preferences
-    notificationsEnabled: true,
-    mentionNotifications: true
+    lastLogout: null
   }));
   console.log(`✅ Initialized ${memoryStorage.users.length} static users`);
 }
@@ -471,27 +465,17 @@ async function getOnlineUsersCount(db) {
 }
 
 // Handle typing indicators
-function handleTypingUpdate(username, room, isTyping, content = '') {
+function handleTypingUpdate(username, room, isTyping) {
   if (isTyping) {
     // Add user to typing list for this room
     if (!memoryStorage.typingUsers.has(room)) {
       memoryStorage.typingUsers.set(room, new Set());
     }
     memoryStorage.typingUsers.get(room).add(username);
-    
-    // NEW: Check for mentions in typing content
-    if (content) {
-      checkForMentions(content, room, username);
-    }
   } else {
     // Remove user from typing list for this room
     if (memoryStorage.typingUsers.has(room)) {
       memoryStorage.typingUsers.get(room).delete(username);
-    }
-    
-    // NEW: Clear typing mentions when user stops typing
-    if (memoryStorage.typingMentions.has(room)) {
-      memoryStorage.typingMentions.get(room).delete(username);
     }
   }
   
@@ -511,61 +495,6 @@ function handleTypingUpdate(username, room, isTyping, content = '') {
   }, username);
   
   console.log(`⌨️ ${username} ${isTyping ? 'started' : 'stopped'} typing in ${room}. Currently typing: ${typingUsers.join(', ')}`);
-}
-
-// NEW: Check for mentions in typing content
-function checkForMentions(content, room, typingUser) {
-  const mentionedUsers = [];
-  
-  // Check for @mentions
-  const mentionRegex = /@(\w+)/g;
-  let match;
-  while ((match = mentionRegex.exec(content)) !== null) {
-    mentionedUsers.push(match[1]);
-  }
-  
-  if (mentionedUsers.length > 0) {
-    // Store typing mentions
-    if (!memoryStorage.typingMentions.has(room)) {
-      memoryStorage.typingMentions.set(room, new Map());
-    }
-    memoryStorage.typingMentions.get(room).set(typingUser, mentionedUsers);
-    
-    // Notify mentioned users
-    mentionedUsers.forEach(mentionedUsername => {
-      // Check if mentioned user exists and is not the typing user
-      const mentionedUser = memoryStorage.users.find(u => u.username === mentionedUsername);
-      if (mentionedUser && mentionedUsername !== typingUser) {
-        // Send mention notification to the mentioned user
-        broadcastToUser(mentionedUsername, {
-          type: 'typingMention',
-          room: room,
-          mentionedBy: typingUser,
-          mentionedByDisplayName: memoryStorage.users.find(u => u.username === typingUser)?.displayName || typingUser,
-          content: content,
-          timestamp: new Date().toISOString()
-        });
-        
-        console.log(`🔔 ${typingUser} mentioned ${mentionedUsername} while typing`);
-      }
-    });
-  }
-}
-
-// NEW: Broadcast to specific user
-function broadcastToUser(username, data) {
-  const message = JSON.stringify(data);
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN && 
-        client.isAuthenticated && 
-        client.user.username === username) {
-      try {
-        client.send(message);
-      } catch (error) {
-        console.error('Error broadcasting to user:', error);
-      }
-    }
-  });
 }
 
 // Handle message seen status
@@ -602,38 +531,6 @@ function handleMessageSeen(username, room, messageId) {
   }
 }
 
-// NEW: Send push notification for new message
-function sendPushNotification(message, room, sender) {
-  // Get all users in the room except the sender
-  const usersInRoom = Array.from(wss.clients)
-    .filter(client => 
-      client.readyState === WebSocket.OPEN && 
-      client.isAuthenticated && 
-      client.user.username !== sender
-    )
-    .map(client => client.user.username);
-
-  // Send notification to each user
-  usersInRoom.forEach(username => {
-    broadcastToUser(username, {
-      type: 'pushNotification',
-      message: {
-        id: message.id,
-        sender: message.sender,
-        senderName: message.senderName,
-        content: message.content,
-        room: room,
-        timestamp: message.timestamp,
-        isFile: message.isFile
-      },
-      notificationType: 'newMessage',
-      timestamp: new Date().toISOString()
-    });
-    
-    console.log(`📢 Push notification sent to ${username} from ${sender}`);
-  });
-}
-
 // ================== API Routes ==================
 
 // Root endpoint
@@ -641,14 +538,13 @@ app.get('/', (req, res) => {
   res.json({
     success: true,
     message: 'WhatsApp Clone API Server 🚀',
-    version: '2.1.0', // Updated version
+    version: '2.0.0',
     database: 'Memory Storage',
     staticUsers: Object.keys(STATIC_USERS),
     totalUsers: memoryStorage.users.length,
     status: 'Running',
     timestamp: new Date().toISOString(),
-    activeConnections: wss.clients.size,
-    features: ['Push Notifications', 'Typing Mentions', 'Auto Reconnect'] // New features
+    activeConnections: wss.clients.size
   });
 });
 
@@ -669,12 +565,7 @@ app.get('/api/health', async (req, res) => {
     onlineUsers: onlineCount,
     activeConnections: wss.clients.size,
     timestamp: new Date().toISOString(),
-    uptime: Math.floor(process.uptime()) + ' seconds',
-    features: {
-      pushNotifications: true,
-      typingMentions: true,
-      autoReconnect: true
-    }
+    uptime: Math.floor(process.uptime()) + ' seconds'
   });
 });
 
@@ -766,60 +657,6 @@ app.get('/api/static-users', (req, res) => {
   });
 });
 
-// NEW: Update user notification settings
-app.post('/api/notification-settings', async (req, res) => {
-  try {
-    const { token, notificationsEnabled, mentionNotifications } = req.body;
-    
-    if (!token) {
-      return res.status(400).json({
-        success: false,
-        error: 'Token is required'
-      });
-    }
-
-    const db = await database.connect();
-    const users = db.collection('users');
-
-    const user = await users.findOne({ token: token });
-
-    if (!user) {
-      return res.status(400).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    await users.updateOne(
-      { token: token },
-      { 
-        $set: { 
-          notificationsEnabled: notificationsEnabled !== undefined ? notificationsEnabled : user.notificationsEnabled,
-          mentionNotifications: mentionNotifications !== undefined ? mentionNotifications : user.mentionNotifications
-        } 
-      }
-    );
-
-    console.log(`🔔 Updated notification settings for ${user.username}`);
-
-    res.json({
-      success: true,
-      message: 'Notification settings updated successfully',
-      settings: {
-        notificationsEnabled: notificationsEnabled !== undefined ? notificationsEnabled : user.notificationsEnabled,
-        mentionNotifications: mentionNotifications !== undefined ? mentionNotifications : user.mentionNotifications
-      }
-    });
-
-  } catch (error) {
-    console.error('Update notification settings error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update notification settings'
-    });
-  }
-});
-
 // Quick Login - Direct login without password for static users
 app.post('/api/quick-login', async (req, res) => {
   try {
@@ -860,9 +697,7 @@ app.post('/api/quick-login', async (req, res) => {
         status: 'offline',
         lastSeen: new Date().toISOString(),
         isStatic: true,
-        createdAt: new Date().toISOString(),
-        notificationsEnabled: true,
-        mentionNotifications: true
+        createdAt: new Date().toISOString()
       };
       await users.insertOne(user);
       console.log(`✅ Created static user: ${staticUser.username}`);
@@ -902,9 +737,7 @@ app.post('/api/quick-login', async (req, res) => {
         token: updatedUser.token,
         status: updatedUser.status,
         lastSeen: updatedUser.lastSeen,
-        isStatic: true,
-        notificationsEnabled: updatedUser.notificationsEnabled,
-        mentionNotifications: updatedUser.mentionNotifications
+        isStatic: true
       }
     });
 
@@ -977,9 +810,7 @@ app.post('/api/login', async (req, res) => {
         token: token,
         status: 'online',
         lastSeen: user.lastSeen,
-        isStatic: user.isStatic,
-        notificationsEnabled: user.notificationsEnabled,
-        mentionNotifications: user.mentionNotifications
+        isStatic: user.isStatic
       }
     });
 
@@ -1164,7 +995,6 @@ wss.on('connection', (ws, req) => {
   ws.isAuthenticated = false;
   ws.connectionId = uuid.v4();
   ws.lastPing = Date.now();
-  ws.isAlive = true;
 
   // Set up ping-pong to keep connection alive
   const pingInterval = setInterval(() => {
@@ -1183,7 +1013,6 @@ wss.on('connection', (ws, req) => {
 
   ws.on('pong', () => {
     ws.lastPing = Date.now();
-    ws.isAlive = true;
   });
 
   ws.on('message', async (data) => {
@@ -1226,21 +1055,13 @@ wss.on('connection', (ws, req) => {
               avatar: user.avatar,
               status: user.status,
               lastSeen: user.lastSeen,
-              isStatic: user.isStatic,
-              notificationsEnabled: user.notificationsEnabled,
-              mentionNotifications: user.mentionNotifications
+              isStatic: user.isStatic
             },
             rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
             users: allUsers,
             onlineCount: onlineUsers.length,
             totalUsers: allUsers.length,
-            message: `Connected successfully. ${onlineUsers.length} users online.`,
-            // NEW: Send connection info for auto-reconnect
-            connectionInfo: {
-              connectionId: ws.connectionId,
-              serverTime: new Date().toISOString(),
-              features: ['pushNotifications', 'typingMentions', 'autoReconnect']
-            }
+            message: `Connected successfully. ${onlineUsers.length} users online.`
           }));
 
           console.log(`✅ WebSocket authenticated: ${user.displayName || user.username}`);
@@ -1255,10 +1076,10 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Enhanced typing indicator with mention detection
+      // Enhanced typing indicator
       if (message.type === 'typing') {
         if (ws.isAuthenticated && ws.user) {
-          handleTypingUpdate(ws.user.username, message.room, message.typing, message.content || '');
+          handleTypingUpdate(ws.user.username, message.room, message.typing);
         }
         return;
       }
@@ -1275,27 +1096,6 @@ wss.on('connection', (ws, req) => {
       if (message.type === 'statusUpdate') {
         if (ws.isAuthenticated && ws.user) {
           await updateUserStatus(ws.user.username, message.status, db);
-        }
-        return;
-      }
-
-      // NEW: Notification settings update
-      if (message.type === 'notificationSettings') {
-        if (ws.isAuthenticated && ws.user) {
-          const db = await database.connect();
-          const users = db.collection('users');
-          
-          await users.updateOne(
-            { username: ws.user.username },
-            { 
-              $set: { 
-                notificationsEnabled: message.notificationsEnabled,
-                mentionNotifications: message.mentionNotifications
-              } 
-            }
-          );
-          
-          console.log(`🔔 ${ws.user.username} updated notification settings`);
         }
         return;
       }
@@ -1335,9 +1135,6 @@ wss.on('connection', (ws, req) => {
           data: newMessage
         });
 
-        // NEW: Send push notifications to users not currently viewing the chat
-        sendPushNotification(newMessage, message.room || 'general', ws.user.username);
-
         console.log(`📨 ${ws.user.username} sent message to ${message.room || 'general'}: ${message.content.substring(0, 50)}${message.content.length > 50 ? '...' : ''}`);
 
         // Stop typing indicator when message is sent
@@ -1375,20 +1172,6 @@ wss.on('connection', (ws, req) => {
       // Handle ping
       if (message.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
-        return;
-      }
-
-      // NEW: Handle reconnection
-      if (message.type === 'reconnect') {
-        if (ws.isAuthenticated && ws.user) {
-          console.log(`🔄 ${ws.user.username} reconnected successfully`);
-          
-          ws.send(JSON.stringify({
-            type: 'reconnectSuccess',
-            message: 'Reconnected successfully',
-            timestamp: new Date().toISOString()
-          }));
-        }
         return;
       }
 
@@ -1433,13 +1216,6 @@ wss.on('connection', (ws, req) => {
         }
       });
       
-      // Remove from typing mentions
-      memoryStorage.typingMentions.forEach((mentionsMap, room) => {
-        if (mentionsMap.has(ws.user.username)) {
-          mentionsMap.delete(ws.user.username);
-        }
-      });
-      
       // Update user status to offline after a short delay
       setTimeout(async () => {
         const db = await database.connect();
@@ -1469,23 +1245,9 @@ wss.on('connection', (ws, req) => {
     status: 'connected',
     message: 'WebSocket connected successfully',
     connectionId: ws.connectionId,
-    totalUsers: memoryStorage.users.length,
-    features: ['pushNotifications', 'typingMentions', 'autoReconnect'],
-    serverTime: new Date().toISOString()
+    totalUsers: memoryStorage.users.length
   }));
 });
-
-// NEW: WebSocket connection health check
-const connectionCheckInterval = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (!ws.isAlive) {
-      console.log('💀 Terminating dead connection');
-      return ws.terminate();
-    }
-    
-    ws.isAlive = false;
-  });
-}, 60000);
 
 // ================== Error Handling ==================
 app.use((error, req, res, next) => {
@@ -1520,11 +1282,6 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🗑️ Clear Chat: DELETE /api/messages/:room`);
   console.log(`✅ Health: http://localhost:${PORT}/api/health`);
   console.log('='.repeat(70));
-  console.log('\n✨ NEW FEATURES:');
-  console.log('   📢 Push Notifications when away from website');
-  console.log('   ⌨️  Typing mentions when someone types your name');
-  console.log('   🔄 Automatic reconnection after browser close');
-  console.log('='.repeat(70));
   
   // Display static users info
   console.log('\n📋 Available Static Users (Password: 123456):');
@@ -1542,8 +1299,6 @@ server.listen(PORT, '0.0.0.0', () => {
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🔄 Shutting down server gracefully...');
-  
-  clearInterval(connectionCheckInterval);
   
   // Set all online users to offline
   try {
