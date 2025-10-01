@@ -63,7 +63,63 @@ const STATIC_USERS = {
 
 // ================== Memory Storage ==================
 const memoryStorage = {
-  users: Object.values(STATIC_USERS).map(user => ({
+  users: [],
+  messages: [
+    {
+      id: '1',
+      sender: 'mustakim',
+      senderName: 'Mustakim',
+      content: 'Hello everyone! 👋 Welcome to our WhatsApp Clone!',
+      room: 'general',
+      timestamp: new Date(Date.now() - 3600000).toISOString(),
+      isFile: false,
+      avatar: '👨‍💻',
+      seenBy: ['mustakim', 'taniya', 'aliya']
+    },
+    {
+      id: '2', 
+      sender: 'taniya',
+      senderName: 'Taniya',
+      content: 'Hey Mustakim! This app looks amazing! 🚀',
+      room: 'general',
+      timestamp: new Date(Date.now() - 1800000).toISOString(),
+      isFile: false,
+      avatar: '😎',
+      seenBy: ['mustakim', 'taniya']
+    },
+    {
+      id: '3',
+      sender: 'aliya',
+      senderName: 'Aliya',
+      content: 'I love the design! Great work everyone! 💫',
+      room: 'general',
+      timestamp: new Date(Date.now() - 900000).toISOString(),
+      isFile: false,
+      avatar: '👩‍💼',
+      seenBy: ['mustakim']
+    },
+    {
+      id: '4',
+      sender: 'saniya',
+      senderName: 'Saniya',
+      content: 'Ready to chat with all of you! ✅',
+      room: 'general', 
+      timestamp: new Date().toISOString(),
+      isFile: false,
+      avatar: '👑',
+      seenBy: []
+    }
+  ],
+  rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
+  activeConnections: new Map(),
+  typingUsers: new Map(),
+  messageSeenStatus: new Map() // Track seen status for messages
+};
+
+// Initialize static users
+function initializeStaticUsers() {
+  console.log('📝 Initializing static users...');
+  memoryStorage.users = Object.values(STATIC_USERS).map(user => ({
     _id: user.id,
     username: user.username,
     email: user.email,
@@ -77,53 +133,12 @@ const memoryStorage = {
     createdAt: new Date().toISOString(),
     lastLogin: null,
     lastLogout: null
-  })),
-  messages: [
-    {
-      id: '1',
-      sender: 'mustakim',
-      senderName: 'Mustakim',
-      content: 'Hello everyone! 👋 Welcome to our WhatsApp Clone!',
-      room: 'general',
-      timestamp: new Date(Date.now() - 3600000).toISOString(),
-      isFile: false,
-      avatar: '👨‍💻'
-    },
-    {
-      id: '2', 
-      sender: 'taniya',
-      senderName: 'Taniya',
-      content: 'Hey Mustakim! This app looks amazing! 🚀',
-      room: 'general',
-      timestamp: new Date(Date.now() - 1800000).toISOString(),
-      isFile: false,
-      avatar: '😎'
-    },
-    {
-      id: '3',
-      sender: 'aliya',
-      senderName: 'Aliya',
-      content: 'I love the design! Great work everyone! 💫',
-      room: 'general',
-      timestamp: new Date(Date.now() - 900000).toISOString(),
-      isFile: false,
-      avatar: '👩‍💼'
-    },
-    {
-      id: '4',
-      sender: 'saniya',
-      senderName: 'Saniya',
-      content: 'Ready to chat with all of you! ✅',
-      room: 'general', 
-      timestamp: new Date().toISOString(),
-      isFile: false,
-      avatar: '👑'
-    }
-  ],
-  rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-  activeConnections: new Map(),
-  typingUsers: new Map() // Track typing users per room
-};
+  }));
+  console.log(`✅ Initialized ${memoryStorage.users.length} static users`);
+}
+
+// Call initialization
+initializeStaticUsers();
 
 // Enhanced Database service
 class DatabaseService {
@@ -423,12 +438,15 @@ async function updateUserStatus(username, status, db) {
     const allUsers = await users.find({})
       .project({ password_hash: 0, token: 0 })
       .toArray();
+
+    const onlineUsers = allUsers.filter(u => u.status === 'online');
     
     // Broadcast user status update to all clients
     broadcastToAllClients(wss, {
       type: 'userStatusUpdate',
       users: allUsers,
-      onlineCount: allUsers.filter(u => u.status === 'online').length,
+      onlineCount: onlineUsers.length,
+      totalUsers: allUsers.length,
       timestamp: new Date().toISOString()
     });
     
@@ -479,6 +497,40 @@ function handleTypingUpdate(username, room, isTyping) {
   console.log(`⌨️ ${username} ${isTyping ? 'started' : 'stopped'} typing in ${room}. Currently typing: ${typingUsers.join(', ')}`);
 }
 
+// Handle message seen status
+function handleMessageSeen(username, room, messageId) {
+  try {
+    const db = database.connect();
+    const messages = db.collection('messages');
+    
+    // Find the message
+    const message = memoryStorage.messages.find(m => m.id === messageId);
+    if (message) {
+      // Add user to seenBy array if not already there
+      if (!message.seenBy) {
+        message.seenBy = [];
+      }
+      if (!message.seenBy.includes(username)) {
+        message.seenBy.push(username);
+        
+        // Broadcast seen update to all clients in the room
+        broadcastToRoom(wss, room, {
+          type: 'messageSeen',
+          room: room,
+          messageId: messageId,
+          seenBy: message.seenBy,
+          seenByUser: username,
+          timestamp: new Date().toISOString()
+        });
+        
+        console.log(`👀 ${username} saw message ${messageId}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error updating message seen status:', error);
+  }
+}
+
 // ================== API Routes ==================
 
 // Root endpoint
@@ -499,7 +551,9 @@ app.get('/', (req, res) => {
 // Health check with WebSocket status
 app.get('/api/health', async (req, res) => {
   const db = await database.connect();
-  const onlineCount = await getOnlineUsersCount(db);
+  const users = db.collection('users');
+  const allUsers = await users.find({}).toArray();
+  const onlineCount = allUsers.filter(u => u.status === 'online').length;
   
   res.json({
     success: true,
@@ -507,7 +561,7 @@ app.get('/api/health', async (req, res) => {
     database: 'Memory Storage 🟢',
     staticUsers: Object.keys(STATIC_USERS).length,
     totalMessages: memoryStorage.messages.length,
-    totalUsers: memoryStorage.users.length,
+    totalUsers: allUsers.length,
     onlineUsers: onlineCount,
     activeConnections: wss.clients.size,
     timestamp: new Date().toISOString(),
@@ -630,7 +684,7 @@ app.post('/api/quick-login', async (req, res) => {
     // Find the user
     let user = await users.findOne({ username: staticUser.username });
 
-    // If user doesn't exist, create from static data (should always exist)
+    // If user doesn't exist, create from static data
     if (!user) {
       user = {
         _id: staticUser.id,
@@ -983,7 +1037,6 @@ wss.on('connection', (ws, req) => {
             .project({ password_hash: 0, token: 0 })
             .toArray();
 
-          // Get online users count
           const onlineUsers = allUsers.filter(u => u.status === 'online');
           
           // Store connection in active connections
@@ -1005,14 +1058,14 @@ wss.on('connection', (ws, req) => {
               isStatic: user.isStatic
             },
             rooms: ['general', 'random', 'help', 'tech', 'games', 'social'],
-            users: allUsers,  // Send ALL users
+            users: allUsers,
             onlineCount: onlineUsers.length,
             totalUsers: allUsers.length,
             message: `Connected successfully. ${onlineUsers.length} users online.`
           }));
 
           console.log(`✅ WebSocket authenticated: ${user.displayName || user.username}`);
-          console.log(`📊 Sent ${allUsers.length} users to client`);
+          console.log(`📊 Sent ${allUsers.length} users to client (${onlineUsers.length} online)`);
 
         } else {
           ws.send(JSON.stringify({
@@ -1027,6 +1080,14 @@ wss.on('connection', (ws, req) => {
       if (message.type === 'typing') {
         if (ws.isAuthenticated && ws.user) {
           handleTypingUpdate(ws.user.username, message.room, message.typing);
+        }
+        return;
+      }
+
+      // Message seen status
+      if (message.type === 'messageSeen') {
+        if (ws.isAuthenticated && ws.user) {
+          handleMessageSeen(ws.user.username, message.room, message.messageId);
         }
         return;
       }
@@ -1061,7 +1122,8 @@ wss.on('connection', (ws, req) => {
           timestamp: new Date().toISOString(),
           isFile: message.isFile || false,
           fileType: message.fileType || null,
-          avatar: ws.user.avatar
+          avatar: ws.user.avatar,
+          seenBy: [ws.user.username] // Sender automatically sees their own message
         };
 
         // Save to database
