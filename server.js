@@ -527,19 +527,11 @@ app.get('/api/users', async (req, res) => {
 
     console.log(`📊 Sending ${users.length} users to client`);
 
-    // Add real-time connection status
-    const usersWithConnectionStatus = users.map(user => ({
-      ...user,
-      isConnected: Array.from(wss.clients).some(client => 
-        client.isAuthenticated && client.user && client.user.username === user.username
-      )
-    }));
-
     const onlineCount = users.filter(u => u.status === 'online').length;
 
     res.json({
       success: true,
-      users: usersWithConnectionStatus,
+      users: users,
       count: users.length,
       onlineCount: onlineCount,
       offlineCount: users.length - onlineCount,
