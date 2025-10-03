@@ -958,8 +958,6 @@ app.post('/api/signup', async (req, res) => {
     });
   }
 });
-
-
     const db = await database.connect();
     const users = db.collection('users');
 
