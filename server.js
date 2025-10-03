@@ -860,6 +860,105 @@ app.post('/api/logout', async (req, res) => {
         error: 'Token is required'
       });
     }
+// Sign Up API - New User Registration
+app.post('/api/signup', async (req, res) => {
+  try {
+    const { username, email, password, displayName, avatar = '👤' } = req.body;
+
+    // Validation
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Username, email and password are required'
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters long'
+      });
+    }
+
+    const db = await database.connect();
+    const users = db.collection('users');
+
+    // Check if user already exists
+    const existingUser = await users.findOne({
+      $or: [
+        { username: username.toLowerCase() },
+        { email: email.toLowerCase() }
+      ]
+    });
+
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        error: 'User with this username or email already exists'
+      });
+    }
+
+    // Create new user
+    const newUser = {
+      _id: uuid.v4(),
+      username: username.toLowerCase(),
+      email: email.toLowerCase(),
+      password_hash: bcrypt.hashSync(password, 10),
+      displayName: displayName || username,
+      avatar: avatar,
+      token: null,
+      status: 'offline',
+      lastSeen: new Date().toISOString(),
+      isStatic: false,
+      createdAt: new Date().toISOString(),
+      lastLogin: null,
+      lastLogout: null
+    };
+
+    await users.insertOne(newUser);
+
+    console.log(`✅ New user registered: ${newUser.displayName}`);
+
+    // Auto login after signup
+    const token = generateToken();
+    
+    await updateUserStatus(newUser.username, 'online', db);
+    
+    await users.updateOne(
+      { username: newUser.username },
+      { 
+        $set: { 
+          token: token,
+          lastLogin: new Date().toISOString()
+        } 
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: `Welcome ${newUser.displayName}! Account created successfully.`,
+      user: {
+        id: newUser._id,
+        username: newUser.username,
+        displayName: newUser.displayName,
+        email: newUser.email,
+        avatar: newUser.avatar,
+        token: token,
+        status: 'online',
+        lastSeen: newUser.lastSeen,
+        isStatic: false
+      }
+    });
+
+  } catch (error) {
+    console.error('Signup error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Registration failed'
+    });
+  }
+});
+
 
     const db = await database.connect();
     const users = db.collection('users');
