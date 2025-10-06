@@ -142,7 +142,6 @@ class DatabaseService {
     try {
       console.log('🔗 Attempting MongoDB connection...');
       
-      // Updated MongoDB connection with better SSL handling
       this.client = new MongoClient(this.connectionString, {
         serverSelectionTimeoutMS: 8000,
         connectTimeoutMS: 10000,
@@ -152,10 +151,8 @@ class DatabaseService {
         maxIdleTimeMS: 30000,
         retryWrites: true,
         retryReads: true,
-        // Remove SSL validation for problematic environments
         tlsAllowInvalidCertificates: true,
         tlsAllowInvalidHostnames: true,
-        // Alternative connection string without SSL
         useNewUrlParser: true,
         useUnifiedTopology: true
       });
@@ -167,7 +164,6 @@ class DatabaseService {
       console.log('✅ Connected to MongoDB Atlas');
       console.log(`📊 Database: ${this.db.databaseName}`);
       
-      // Test the connection
       await this.db.command({ ping: 1 });
       console.log('✅ MongoDB ping successful');
       
@@ -176,7 +172,6 @@ class DatabaseService {
       console.error('❌ MongoDB connection failed, using memory storage:', error.message);
       this.isConnected = false;
       this.db = null;
-      // Don't throw error, fallback to memory storage
       return null;
     }
   }
@@ -264,6 +259,8 @@ function broadcastToAllClients(data) {
 
 function broadcastToRoom(room, data, excludeUser = null) {
   const message = JSON.stringify(data);
+  console.log(`📤 Broadcasting to room ${room}:`, data.type);
+  
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && 
         client.isAuthenticated && 
@@ -271,8 +268,9 @@ function broadcastToRoom(room, data, excludeUser = null) {
         (!excludeUser || client.user.username !== excludeUser)) {
       try {
         client.send(message);
+        console.log(`✅ Sent to ${client.user.username}`);
       } catch (error) {
-        console.error('Error broadcasting to client in room:', error);
+        console.error(`❌ Error sending to ${client.user.username}:`, error);
       }
     }
   });
@@ -280,7 +278,6 @@ function broadcastToRoom(room, data, excludeUser = null) {
 
 async function updateUserStatus(username, status) {
   try {
-    // Try MongoDB first
     if (database.isConnected) {
       const db = await database.connect();
       const users = db.collection('users');
@@ -300,7 +297,6 @@ async function updateUserStatus(username, status) {
       );
     }
     
-    // Always update memory storage
     const userIndex = memoryStorage.users.findIndex(u => u.username === username);
     if (userIndex !== -1) {
       memoryStorage.users[userIndex].status = status;
@@ -314,15 +310,13 @@ async function updateUserStatus(username, status) {
     
     console.log(`👤 ${username} is now ${status}`);
     
-    // Get all users for broadcasting
     const allUsers = memoryStorage.users.map(user => ({
       ...user,
-      password_hash: undefined // Remove sensitive data
+      password_hash: undefined
     }));
 
     const onlineUsers = allUsers.filter(u => u.status === 'online');
     
-    // Broadcast user status update to all clients
     broadcastToAllClients({
       type: 'userStatusUpdate',
       users: allUsers,
@@ -373,10 +367,8 @@ function handleTypingUpdate(username, room, isTyping) {
   }
 }
 
-// Handle message seen status
 function handleMessageSeen(username, room, messageId) {
   try {
-    // Update in memory first for immediate response
     if (memoryStorage.messageSeenStatus.has(messageId)) {
       const seenBy = memoryStorage.messageSeenStatus.get(messageId);
       if (!seenBy.includes(username)) {
@@ -386,7 +378,6 @@ function handleMessageSeen(username, room, messageId) {
       memoryStorage.messageSeenStatus.set(messageId, [username]);
     }
     
-    // Update in messages array
     const messageIndex = memoryStorage.messages.findIndex(m => m.id === messageId);
     if (messageIndex !== -1) {
       if (!memoryStorage.messages[messageIndex].seenBy) {
@@ -397,7 +388,6 @@ function handleMessageSeen(username, room, messageId) {
       }
     }
     
-    // Broadcast seen update to all clients in the room
     broadcastToRoom(room, {
       type: 'messageSeen',
       room: room,
@@ -417,7 +407,6 @@ function handleMessageSeen(username, room, messageId) {
 
 // ================== API Routes ==================
 
-// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     success: true,
@@ -431,7 +420,6 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check
 app.get('/api/health', async (req, res) => {
   const dbStatus = database.isConnected ? 'MongoDB Atlas 🟢' : 'Memory Storage 🟡';
   const onlineUsers = memoryStorage.users.filter(u => u.status === 'online').length;
@@ -450,7 +438,6 @@ app.get('/api/health', async (req, res) => {
   });
 });
 
-// Get ALL users
 app.get('/api/users', async (req, res) => {
   try {
     const allUsers = memoryStorage.users.map(user => ({
@@ -485,7 +472,6 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Get Static Users Info
 app.get('/api/static-users', (req, res) => {
   const usersInfo = Object.values(STATIC_USERS).map(user => ({
     username: user.username,
@@ -505,7 +491,6 @@ app.get('/api/static-users', (req, res) => {
   });
 });
 
-// ✅ FIXED QUICK LOGIN ENDPOINT
 app.post('/api/quick-login', async (req, res) => {
   try {
     const { username } = req.body;
@@ -526,13 +511,9 @@ app.post('/api/quick-login', async (req, res) => {
       });
     }
 
-    // Find user in memory storage
     let user = memoryStorage.users.find(u => u.username === staticUser.username);
-
-    // Generate token
     const token = generateToken();
 
-    // Update user status to online
     user.token = token;
     user.status = 'online';
     user.lastLogin = new Date().toISOString();
@@ -564,7 +545,6 @@ app.post('/api/quick-login', async (req, res) => {
   }
 });
 
-// ✅ FIXED REGULAR LOGIN
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -576,7 +556,6 @@ app.post('/api/login', async (req, res) => {
       });
     }
 
-    // Find user in memory storage
     const user = memoryStorage.users.find(u => u.email === email.toLowerCase());
 
     if (!user) {
@@ -596,7 +575,6 @@ app.post('/api/login', async (req, res) => {
 
     const token = generateToken();
 
-    // Update user status and token in memory storage
     user.token = token;
     user.status = 'online';
     user.lastLogin = new Date().toISOString();
@@ -628,14 +606,12 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ✅ FIXED SIGNUP ENDPOINT
 app.post('/api/signup', async (req, res) => {
   try {
     const { username, email, password, displayName, avatar = '👤' } = req.body;
 
     console.log('📝 Signup attempt:', { username, email, displayName });
 
-    // Validation
     if (!username || !email || !password) {
       return res.status(400).json({
         success: false,
@@ -657,7 +633,6 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Check if user already exists in memory storage
     const existingUser = memoryStorage.users.find(u => 
       u.username === username.toLowerCase() || u.email === email.toLowerCase()
     );
@@ -669,7 +644,6 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Create new user in memory storage
     const newUser = {
       id: uuid.v4(),
       username: username.toLowerCase(),
@@ -690,7 +664,6 @@ app.post('/api/signup', async (req, res) => {
 
     console.log(`✅ New user registered: ${newUser.displayName}`);
 
-    // Auto login after signup
     const token = generateToken();
     newUser.token = token;
     newUser.status = 'online';
@@ -721,7 +694,6 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Logout endpoint
 app.post('/api/logout', async (req, res) => {
   try {
     const token = req.headers.authorization;
@@ -733,7 +705,6 @@ app.post('/api/logout', async (req, res) => {
       });
     }
 
-    // Find user in memory storage and logout
     const user = memoryStorage.users.find(u => u.token === token);
     if (user) {
       user.status = 'offline';
@@ -758,7 +729,6 @@ app.post('/api/logout', async (req, res) => {
   }
 });
 
-// File upload
 app.post('/api/upload', upload.single('file'), (req, res) => {
   try {
     if (!req.file) {
@@ -787,7 +757,6 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   }
 });
 
-// Get messages for a room
 app.get('/api/messages/:room', async (req, res) => {
   try {
     const { room } = req.params;
@@ -812,7 +781,6 @@ app.get('/api/messages/:room', async (req, res) => {
   }
 });
 
-// Get all rooms
 app.get('/api/rooms', async (req, res) => {
   try {
     res.json({
@@ -830,19 +798,16 @@ app.get('/api/rooms', async (req, res) => {
   }
 });
 
-// Clear messages in a room
 app.delete('/api/messages/:room', async (req, res) => {
   try {
     const { room } = req.params;
     
-    // Clear messages from memory storage
     const initialLength = memoryStorage.messages.length;
     memoryStorage.messages = memoryStorage.messages.filter(m => m.room !== room);
     const clearedCount = initialLength - memoryStorage.messages.length;
 
     console.log(`🗑️ Cleared ${clearedCount} messages from room: ${room}`);
 
-    // Broadcast clear event to all clients
     broadcastToAllClients({
       type: 'clear',
       room: room,
@@ -908,11 +873,9 @@ wss.on('connection', (ws, req) => {
           ws.isAuthenticated = true;
           ws.isActive = true;
           
-          // Update user status to online
           user.status = 'online';
           user.lastLogin = new Date().toISOString();
 
-          // Get ALL users for the client (remove sensitive data)
           const allUsers = memoryStorage.users.map(u => ({
             id: u.id,
             username: u.username,
@@ -926,7 +889,6 @@ wss.on('connection', (ws, req) => {
 
           const onlineUsers = allUsers.filter(u => u.status === 'online');
           
-          // Store connection in active connections
           memoryStorage.activeConnections.set(user.username, {
             ws: ws,
             user: user,
@@ -954,6 +916,15 @@ wss.on('connection', (ws, req) => {
 
           console.log(`✅ WebSocket authenticated: ${user.displayName || user.username}`);
 
+          // Broadcast user status update to all clients
+          broadcastToAllClients({
+            type: 'userStatusUpdate',
+            users: allUsers,
+            onlineCount: onlineUsers.length,
+            totalUsers: allUsers.length,
+            timestamp: new Date().toISOString()
+          });
+
         } else {
           ws.send(JSON.stringify({
             type: 'authError',
@@ -968,7 +939,6 @@ wss.on('connection', (ws, req) => {
         if (ws.isAuthenticated && ws.user) {
           ws.isActive = message.isActive;
           
-          // Update user presence
           if (memoryStorage.userPresence.has(ws.user.username)) {
             memoryStorage.userPresence.set(ws.user.username, {
               ...memoryStorage.userPresence.get(ws.user.username),
@@ -998,7 +968,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // Handle new message
+      // ✅ FIXED: Handle new message - THIS WAS THE MAIN ISSUE
       if (message.type === 'message') {
         if (!ws.isAuthenticated || !ws.user) {
           ws.send(JSON.stringify({
@@ -1007,6 +977,12 @@ wss.on('connection', (ws, req) => {
           }));
           return;
         }
+
+        console.log('📝 Creating new message:', {
+          sender: ws.user.username,
+          content: message.content,
+          room: message.room
+        });
 
         const newMessage = {
           id: uuid.v4(),
@@ -1018,25 +994,29 @@ wss.on('connection', (ws, req) => {
           isFile: message.isFile || false,
           fileType: message.fileType || null,
           avatar: ws.user.avatar,
-          seenBy: [ws.user.username] // Sender automatically sees their own message
+          seenBy: [ws.user.username]
         };
 
         // Save to memory storage
         memoryStorage.messages.push(newMessage);
+        console.log(`💾 Message saved to memory. Total messages: ${memoryStorage.messages.length}`);
 
-        // Initialize seen status in memory
+        // Initialize seen status
         memoryStorage.messageSeenStatus.set(newMessage.id, [ws.user.username]);
 
-        // Broadcast to all clients in the room
-        broadcastToRoom(message.room || 'general', {
+        // ✅ FIXED: Broadcast to all clients in the room including sender
+        const broadcastData = {
           type: 'message',
           data: newMessage
-        });
+        };
 
-        console.log(`📨 ${ws.user.username} sent message to ${message.room || 'general'}: ${message.content.substring(0, 50)}${message.content.length > 50 ? '...' : ''}`);
+        console.log(`📤 Broadcasting message to room: ${message.room || 'general'}`);
+        broadcastToRoom(message.room || 'general', broadcastData);
 
-        // Stop typing indicator when message is sent
+        // Stop typing indicator
         handleTypingUpdate(ws.user.username, message.room || 'general', false);
+        
+        console.log(`✅ Message sent successfully by ${ws.user.username}`);
         return;
       }
 
@@ -1050,16 +1030,13 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // Clear messages from memory storage for this room
         const initialLength = memoryStorage.messages.length;
         memoryStorage.messages = memoryStorage.messages.filter(m => m.room !== message.room);
         const clearedCount = initialLength - memoryStorage.messages.length;
 
-        // Clear memory storage for this room
         memoryStorage.typingUsers.delete(message.room);
         memoryStorage.messageSeenStatus.clear();
 
-        // Broadcast clear event to all clients
         broadcastToAllClients({
           type: 'clear',
           room: message.room,
@@ -1078,7 +1055,7 @@ wss.on('connection', (ws, req) => {
       }
 
     } catch (error) {
-      console.error('WebSocket message error:', error);
+      console.error('❌ WebSocket message error:', error);
       try {
         ws.send(JSON.stringify({
           type: 'error',
@@ -1099,14 +1076,11 @@ wss.on('connection', (ws, req) => {
     if (ws.user) {
       console.log('👤 User disconnected:', ws.user.displayName || ws.user.username);
       
-      // Remove from active connections
       memoryStorage.activeConnections.delete(ws.user.username);
       
-      // Remove from all typing lists
       memoryStorage.typingUsers.forEach((typingSet, room) => {
         if (typingSet.has(ws.user.username)) {
           typingSet.delete(ws.user.username);
-          // Broadcast typing stop
           broadcastToRoom(room, {
             type: 'typingUpdate',
             room: room,
@@ -1118,7 +1092,6 @@ wss.on('connection', (ws, req) => {
         }
       });
       
-      // Update user status to offline after a short delay
       setTimeout(async () => {
         const currentConnections = Array.from(memoryStorage.activeConnections.entries())
           .filter(([username, conn]) => username === ws.user.username);
@@ -1129,6 +1102,21 @@ wss.on('connection', (ws, req) => {
             user.status = 'offline';
             user.lastSeen = new Date().toISOString();
             console.log(`👤 ${ws.user.username} set to offline`);
+            
+            // Broadcast status update
+            const allUsers = memoryStorage.users.map(u => ({
+              ...u,
+              password_hash: undefined
+            }));
+            const onlineUsers = allUsers.filter(u => u.status === 'online');
+            
+            broadcastToAllClients({
+              type: 'userStatusUpdate',
+              users: allUsers,
+              onlineCount: onlineUsers.length,
+              totalUsers: allUsers.length,
+              timestamp: new Date().toISOString()
+            });
           }
         }
       }, 5000);
@@ -1163,7 +1151,6 @@ app.use((error, req, res, next) => {
   });
 });
 
-// 404 Handler
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -1179,7 +1166,6 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🚀 WhatsApp Server Running on Port ${PORT}`);
   console.log(`🌐 URL: http://localhost:${PORT}`);
   
-  // Try to connect to MongoDB but don't fail if it doesn't work
   try {
     await database.connect();
     console.log(`💾 Database: MongoDB Atlas 🟢`);
@@ -1203,11 +1189,9 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log('='.repeat(70));
 });
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n🔄 Shutting down server gracefully...');
   
-  // Set all users to offline in memory storage
   memoryStorage.users.forEach(user => {
     user.status = 'offline';
     user.lastSeen = new Date().toISOString();
