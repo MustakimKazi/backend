@@ -282,6 +282,7 @@ function broadcastToRoom(room, data, excludeUser = null) {
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN && 
         client.isAuthenticated && 
+        client.user && 
         (!excludeUser || client.user.username !== excludeUser)) {
       try {
         client.send(message);
@@ -903,6 +904,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', async (data) => {
     try {
       const message = JSON.parse(data.toString());
+      console.log('📨 WebSocket message received:', message.type);
 
       // Authentication
       if (message.type === 'auth') {
@@ -1017,9 +1019,60 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      // Handle message seen
+      if (message.type === 'messageSeen') {
+        if (ws.isAuthenticated && ws.user) {
+          const db = await database.connect();
+          const messages = db.collection('messages');
+          
+          // Update message in database
+          await messages.updateOne(
+            { id: message.messageId },
+            { $addToSet: { seenBy: ws.user.username } }
+          );
+
+          // Get updated message
+          const updatedMessage = await messages.findOne({ id: message.messageId });
+          
+          if (updatedMessage) {
+            // Broadcast seen update to all clients in the room
+            broadcastToRoom(message.room, {
+              type: 'messageSeen',
+              messageId: message.messageId,
+              seenBy: updatedMessage.seenBy,
+              seenByUser: ws.user.username,
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+        return;
+      }
+
       // Handle ping
       if (message.type === 'ping') {
         ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+
+      // Handle clear chat
+      if (message.type === 'clear') {
+        if (ws.isAuthenticated && ws.user) {
+          const db = await database.connect();
+          const messages = db.collection('messages');
+          
+          // Delete all messages in the room
+          await messages.deleteMany({ room: message.room });
+          
+          // Broadcast clear to all clients in the room
+          broadcastToRoom(message.room, {
+            type: 'clear',
+            room: message.room,
+            clearedBy: ws.user.username,
+            timestamp: new Date().toISOString()
+          });
+          
+          console.log(`🗑️ ${ws.user.username} cleared chat in ${message.room}`);
+        }
         return;
       }
 
@@ -1158,4 +1211,4 @@ process.on('SIGINT', async () => {
   
   await database.close();
   process.exit(0);
-}); 
+});
